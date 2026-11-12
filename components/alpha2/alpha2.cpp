@@ -774,6 +774,28 @@ void Alpha2::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc
   }
 }
 
+uint16_t Alpha2::calculate_crc_(const uint8_t *data, size_t len) {
+  // CRC-16-CCITT, polynomial 0x1021, initial value 0xFFFF, final XOR 0xFFFF.
+  // Verified against the flow_head/power read requests above.
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= static_cast<uint16_t>(data[i]) << 8;
+    for (int j = 0; j < 8; j++) {
+      crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021) : static_cast<uint16_t>(crc << 1);
+    }
+  }
+  return crc ^ 0xFFFF;
+}
+
+void Alpha2::finalize_and_send_(uint8_t *frame, size_t total_len, size_t first_chunk_len) {
+  uint16_t crc = this->calculate_crc_(frame + 1, total_len - 3);
+  frame[total_len - 2] = crc >> 8;
+  frame[total_len - 1] = crc & 0xFF;
+  this->send_request_(frame, first_chunk_len);
+  if (first_chunk_len < total_len)
+    this->send_request_(frame + first_chunk_len, total_len - first_chunk_len);
+}
+
 void Alpha2::send_request_(uint8_t *request, size_t len) {
   auto status =
       esp_ble_gattc_write_char(this->parent_->get_gattc_if(), this->parent_->get_conn_id(), this->geni_handle_, len,
@@ -997,28 +1019,6 @@ void Alpha2::update() {
 // ---------------------------------------------------------------------------
 
 #ifdef USE_SWITCH
-uint16_t Alpha2::calculate_crc_(const uint8_t *data, size_t len) {
-  // CRC-16-CCITT, polynomial 0x1021, initial value 0xFFFF, final XOR 0xFFFF.
-  // Verified against the flow_head/power read requests above.
-  uint16_t crc = 0xFFFF;
-  for (size_t i = 0; i < len; i++) {
-    crc ^= static_cast<uint16_t>(data[i]) << 8;
-    for (int j = 0; j < 8; j++) {
-      crc = (crc & 0x8000) ? static_cast<uint16_t>((crc << 1) ^ 0x1021) : static_cast<uint16_t>(crc << 1);
-    }
-  }
-  return crc ^ 0xFFFF;
-}
-
-void Alpha2::finalize_and_send_(uint8_t *frame, size_t total_len, size_t first_chunk_len) {
-  uint16_t crc = this->calculate_crc_(frame + 1, total_len - 3);
-  frame[total_len - 2] = crc >> 8;
-  frame[total_len - 1] = crc & 0xFF;
-  this->send_request_(frame, first_chunk_len);
-  if (first_chunk_len < total_len)
-    this->send_request_(frame + first_chunk_len, total_len - first_chunk_len);
-}
-
 void Alpha2::reapply_last_command_() {
   if (this->power_switch_ != nullptr) {
     ESP_LOGI(TAG, "[%s] Re-applying last known power state after (re)connect: %s", this->parent_->address_str(),

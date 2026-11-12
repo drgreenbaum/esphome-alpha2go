@@ -569,6 +569,9 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   void request_device_info_(uint8_t field_id);
 #endif
   void send_request_(uint8_t *request, size_t len);
+  // CRC-16-CCITT + (optionally split) send, used by every request/write.
+  uint16_t calculate_crc_(const uint8_t *data, size_t len);
+  void finalize_and_send_(uint8_t *frame, size_t total_len, size_t first_chunk_len);
   bool is_current_response_type_(const uint8_t *response_type);
 #ifdef USE_SWITCH
   // We can't read the pump's actual current on/off state back (no known
@@ -579,7 +582,6 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   // since a dropped-and-recovered BLE link leaves us equally unsure of the
   // pump's actual state.
   void reapply_last_command_();
-  uint16_t calculate_crc_(const uint8_t *data, size_t len);
   void send_commands_(const uint8_t *command_ids, size_t num_commands);
   // Shared tail for every write_*() below (2026-09-04): computes the live
   // CRC over frame[1 . total_len-3], writes it into the frame's last 2
@@ -587,7 +589,6 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   // than `first_chunk_len` bytes (matching the app's own MTU fragmentation),
   // or as one write if first_chunk_len == total_len. Factored out to avoid
   // repeating this same 4-line CRC+split pattern in ~15 write_*() functions.
-  void finalize_and_send_(uint8_t *frame, size_t total_len, size_t first_chunk_len);
 #endif
 };
 
