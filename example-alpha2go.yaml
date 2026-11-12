@@ -1,0 +1,213 @@
+# Complete example for a dedicated ESP32 talking to a Grundfos ALPHA2 GO
+# over BLE. Tested on an ESP32-C6 (ESP-IDF framework). Remove whatever you
+# do not need - only the registers behind configured entities are polled.
+
+esphome:
+  name: alpha2go
+  friendly_name: ALPHA2 GO
+
+esp32:
+  board: esp32-c6-devkitc-1
+  variant: esp32c6
+  framework:
+    type: esp-idf
+
+external_components:
+  - source: github://drgreenbaum/esphome-alpha2go
+    components: [alpha2]
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+esp32_ble_tracker:
+
+# The pump only accepts writes (mode, setpoints, settings) over a bonded LE
+# Secure Connections link, exactly like the Grundfos GO app does.
+esp32_ble:
+  max_connections: 2
+  auth_req_mode: sc_bond
+
+ble_client:
+  - mac_address: XX:XX:XX:XX:XX:XX  # your pump's BLE MAC
+    id: alpha2_ble
+
+sensor:
+  - platform: alpha2
+    id: alpha2_pump
+    ble_client_id: alpha2_ble
+    update_interval: 15s
+    flow:
+      name: "Flow"
+      device_class: volume_flow_rate
+      state_class: measurement
+    head:
+      name: "Head"
+      state_class: measurement
+    speed:
+      name: "Speed"
+      state_class: measurement
+    power:
+      name: "Power"
+      device_class: power
+      state_class: measurement
+    voltage:
+      name: "Voltage"
+      device_class: voltage
+      state_class: measurement
+    current:
+      name: "Current"
+      device_class: current
+      state_class: measurement
+    media_temperature:
+      name: "Media temperature"
+    start_count:
+      name: "Start count"
+      entity_category: diagnostic
+    warning_code:
+      name: "Warning code"
+    alarm_code:
+      name: "Alarm code"
+
+binary_sensor:
+  - platform: alpha2
+    alpha2_id: alpha2_pump
+    venting_active:
+      name: "Venting active"
+      entity_category: diagnostic
+
+text_sensor:
+  - platform: alpha2
+    alpha2_id: alpha2_pump
+    active_warning:
+      name: "Active warning"
+    active_alarm:
+      name: "Active alarm"
+    last_event:
+      name: "Last event"
+    product_type:
+      name: "Product type"
+      entity_category: diagnostic
+    product_no:
+      name: "Product number"
+      entity_category: diagnostic
+    serial_no:
+      name: "Serial number"
+      entity_category: diagnostic
+    production_code:
+      name: "Production code"
+      entity_category: diagnostic
+    gsc_description:
+      name: "GSC description"
+      entity_category: diagnostic
+    gsc_identification:
+      name: "GSC identification"
+      entity_category: diagnostic
+    app_software:
+      name: "App software"
+      entity_category: diagnostic
+    ble_software:
+      name: "BLE software"
+      entity_category: diagnostic
+
+switch:
+  - platform: alpha2
+    type: power
+    alpha2_id: alpha2_pump
+    name: "Pump start/stop"
+    restore_mode: RESTORE_DEFAULT_ON
+  - platform: alpha2
+    type: external_control
+    alpha2_id: alpha2_pump
+    name: "External (PWM) control"
+    entity_category: config
+  - platform: alpha2
+    type: night_setback
+    alpha2_id: alpha2_pump
+    name: "Night setback"
+    entity_category: config
+  - platform: alpha2
+    type: min_flow_limit
+    alpha2_id: alpha2_pump
+    name: "Min flow limit"
+    entity_category: config
+  - platform: alpha2
+    type: max_flow_limit
+    alpha2_id: alpha2_pump
+    name: "Max flow limit"
+    entity_category: config
+  - platform: alpha2
+    type: continuous_venting
+    alpha2_id: alpha2_pump
+    name: "Continuous air detection and venting"
+    entity_category: config
+  - platform: alpha2
+    type: panel_lock
+    alpha2_id: alpha2_pump
+    name: "Panel lock"
+    entity_category: config
+  - platform: alpha2
+    type: prevent_display_sleep
+    alpha2_id: alpha2_pump
+    name: "Prevent display sleep"
+    entity_category: config
+
+select:
+  - platform: alpha2
+    alpha2_id: alpha2_pump
+    name: "Operating mode"
+
+number:
+  # Pressure: constant/proportional pressure (not AutoAdapt). Flow: constant
+  # flow. Speed: constant curve. A setpoint has no effect in other modes.
+  - platform: alpha2
+    type: pressure_setpoint
+    alpha2_id: alpha2_pump
+    name: "Pressure setpoint"
+  - platform: alpha2
+    type: flow_setpoint
+    alpha2_id: alpha2_pump
+    name: "Flow setpoint"
+  - platform: alpha2
+    type: speed_setpoint
+    alpha2_id: alpha2_pump
+    name: "Speed setpoint"
+  - platform: alpha2
+    type: min_flow_limit
+    alpha2_id: alpha2_pump
+    name: "Min flow limit value"
+    entity_category: config
+  - platform: alpha2
+    type: max_flow_limit
+    alpha2_id: alpha2_pump
+    name: "Max flow limit value"
+    entity_category: config
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: diagnostic
+  - platform: template
+    name: "Vent pump"
+    icon: mdi:water
+    on_press:
+      - lambda: id(alpha2_pump)->write_venting(true, 0x01);
+  - platform: template
+    name: "Vent system and pump"
+    icon: mdi:water-plus
+    on_press:
+      - lambda: id(alpha2_pump)->write_venting(true, 0x02);
+  - platform: template
+    name: "Cancel venting"
+    icon: mdi:water-off
+    on_press:
+      - lambda: id(alpha2_pump)->write_venting(false);
