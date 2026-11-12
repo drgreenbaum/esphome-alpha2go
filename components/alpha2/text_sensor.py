@@ -22,6 +22,10 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional("active_warning"): text_sensor.text_sensor_schema(icon="mdi:alert-outline"),
         cv.Optional("active_alarm"): text_sensor.text_sensor_schema(icon="mdi:alert-octagon"),
         cv.Optional("last_event"): text_sensor.text_sensor_schema(icon="mdi:history"),
+        # Realized request (86/8): who controls the pump and how.
+        cv.Optional("control_source"): text_sensor.text_sensor_schema(icon="mdi:account-cog"),
+        cv.Optional("operation_mode"): text_sensor.text_sensor_schema(icon="mdi:state-machine"),
+        cv.Optional("control_mode"): text_sensor.text_sensor_schema(icon="mdi:tune"),
     }
 )
 
@@ -65,6 +69,9 @@ async def to_code(config):
         ("active_warning", hub.set_active_warning_text_sensor),
         ("active_alarm", hub.set_active_alarm_text_sensor),
         ("last_event", hub.set_last_event_text_sensor),
+        ("control_source", hub.set_control_source_text_sensor),
+        ("operation_mode", hub.set_operation_mode_text_sensor),
+        ("control_mode", hub.set_control_mode_text_sensor),
     ):
         if key_config := config.get(key):
             sens = await text_sensor.new_text_sensor(key_config)

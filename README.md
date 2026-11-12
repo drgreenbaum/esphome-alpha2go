@@ -9,16 +9,23 @@ Read and control a **Grundfos ALPHA2 GO** circulator pump over Bluetooth Low Ene
 | What | Read | Write | Entity |
 | --- | :---: | :---: | --- |
 | Flow, head, speed, power, voltage, current | ✓ | – | `sensor` |
-| Calculated media temperature, number of starts | ✓ | – | `sensor` |
+| Calculated media temperature, number of starts, Kv, DC link voltage, differential/converter/inverter temperature¹ | ✓ | – | `sensor` |
+| Status: control source, operation mode, control mode, AutoAdapt, set point running right now | ✓ | – | `text_sensor`, `binary_sensor`, `sensor` |
 | **Active warning / active alarm** (code and text) | ✓ | – | `sensor` (code), `text_sensor` (text) |
 | **Last event-log entry** with operating time | ✓ | – | `text_sensor` |
 | Operating mode: constant pressure, proportional pressure, constant curve, constant flow, AutoAdapt variants | ✓ | ✓ | `select` |
-| Pressure, flow and speed setpoints | ✓ | ✓ | `number` |
+| Panel settings I/II/III (constant curve, constant pressure, proportional pressure) and AutoAdapt | ✓ | ✓ | `select` |
+| Normal / min curve / max curve | ✓ | ✓ | `select` |
+| Constant pressure, proportional pressure, flow and speed setpoints | ✓ | ✓ | `number` |
 | Min/max flow limitation (enable + value) | ✓ | ✓ | `switch` + `number` |
 | External (PWM) control, night setback, panel lock, prevent display sleep, continuous air detection and venting | ✓ | ✓ | `switch` |
 | Pump start/stop | – | ✓ | `switch` |
 | Manual venting (pump / system + pump), cancel | ✓ | ✓ | `binary_sensor` + `write_venting()` |
 | Product info (type, product no., serial, firmware, …) | ✓ | – | `text_sensor` |
+
+¹ The temperatures are reported as NaN (entity stays `unknown`) by some variants, e.g. the XX-60.
+
+A "duty point" (flow + head) in Grundfos GO is not a separate setting: the app converts it into an ordinary constant- or proportional-pressure set point, which you can set directly here.
 
 ## Requirements
 
@@ -71,29 +78,39 @@ The `sensor` platform creates the hub (`id`), which the other platforms referenc
 | `media_temperature` | °C | Calculated by the pump |
 | `start_count` | – | Total number of starts |
 | `warning_code`, `alarm_code` | – | First active code, `0` = none |
+| `flow_coefficient_kv`, `dc_link_voltage` | –, V | |
+| `differential_temperature`, `converter_temperature`, `inverter_temperature` | K, °C, °C | NaN on some variants |
+| `setpoint_head`, `setpoint_speed`, `setpoint_flow` | m, rpm, m³/h | Set point the pump runs right now; only the active mode's value is set |
 | `operating_mode`, `external_control`, `night_setback`, `venting_status`, `venting_countdown` | – | Raw diagnostic values; prefer the select/switches |
 
 ### `text_sensor`
 
-`active_warning`, `active_alarm` (e.g. `25 – Incorrect PWM configuration`, `None` when empty), `last_event` (e.g. `35 – Air in pump head (operating time 11 d 4 h 14 min)`), plus product info: `product_type`, `product_no`, `serial_no`, `production_code`, `gsc_description`, `gsc_identification`, `app_software`, `ble_software`.
+`active_warning`, `active_alarm` (e.g. `25 – Incorrect PWM configuration`, `None` when empty), `last_event` (e.g. `35 – Air in pump head (operating time 11 d 4 h 14 min)`), `control_source` (e.g. `Local (panel or app)`, `PWM`, `AutoNight`), `operation_mode` (`Auto`, `Stop`, `Min curve`, `Max curve`, …), `control_mode`, plus product info: `product_type`, `product_no`, `serial_no`, `production_code`, `gsc_description`, `gsc_identification`, `app_software`, `ble_software`.
 
 ### `binary_sensor`
 
-`venting_active` – a manual venting cycle is running.
+`venting_active` – a manual venting cycle is running. `autoadapt` – an AutoAdapt control mode is active.
 
 ### `switch` (`type:`)
 
 `power` (start/stop), `external_control`, `night_setback`, `min_flow_limit`, `max_flow_limit`, `continuous_venting`, `panel_lock`, `prevent_display_sleep`.
 
-### `select`
+### `select` (`type:`)
 
-Operating mode: `Constant pressure`, `Proportional pressure`, `Constant curve`, `Constant flow`, `Proportional pressure + AutoAdapt`, `Constant pressure + AutoAdapt`. The select follows the mode the pump reports, so changes made on the pump's panel or in the app show up as well.
+| Type | Options |
+| --- | --- |
+| `operating_mode` (default) | `Constant pressure`, `Proportional pressure`, `Constant curve`, `Constant flow`, `Proportional pressure + AutoAdapt`, `Constant pressure + AutoAdapt` |
+| `panel_setting` | `Constant curve I`–`III`, `Constant pressure I`–`III`, `Proportional pressure I`–`III`, the two AutoAdapt settings, and `Advanced` (any other set point) |
+| `curve` | `Normal`, `Min curve`, `Max curve` |
+
+All three follow what the pump reports, so changes made on the panel or in the app show up too. `panel_setting` uses the pump's own I/II/III values (read from the pump, so they match your variant); they are read one per poll cycle, so a selection made within the first ~2.5 minutes after connecting is refused with a log warning. `Normal` sends START, which also starts a stopped pump.
 
 ### `number` (`type:`)
 
 | Type | Range | Effective in |
 | --- | --- | --- |
-| `pressure_setpoint` | 1.0–4.5 m | Constant / proportional pressure (not AutoAdapt) |
+| `constant_pressure_setpoint` | 1.0–4.5 m | Constant pressure |
+| `proportional_pressure_setpoint` | 1.0–4.5 m | Proportional pressure (`pressure_setpoint` is a deprecated alias) |
 | `flow_setpoint` | 0.3–2.9 m³/h | Constant flow |
 | `speed_setpoint` | 2163–5163 rpm | Constant curve |
 | `min_flow_limit`, `max_flow_limit` | 0.25–3.5 m³/h | Setting a value also enables the limit |
@@ -145,7 +162,9 @@ The pump speaks Grundfos GENIbus over a single GATT characteristic (service `0xF
 
 - **Reads** are Class 10 (`0x0a`) GET requests, `27 07 e7 f8 0a 03 <obj> <sub-id hi> <sub-id lo> <crc>`. Responses are matched on an 8-byte type header, and several registers share one header and are told apart by a data byte.
 - **Writes** are Class 10 SET frames. They **must be split into two BLE writes** with the same fragment sizes the app uses (20 + 4 bytes for the 24-byte frames, 20 + 15 for the 35-byte frames). Sent as a single write, the pump ignores them. That was the cause of every early write failure, not CRC, bonding or session state.
-- **Start/stop** uses Class 3 commands (REMOTE + START/STOP).
+- **Start/stop** uses Class 3 commands (REMOTE + START/STOP); min/max curve are the single commands MIN (25) / MAX (26), and START (6) returns to normal.
+- **Set points** are type-302 objects: `86/16` constant pressure, `86/18` proportional pressure, `86/14` constant curve (rpm), `86/40` constant flow (m³/s). Pressure is in Pa (1 m = 9804 Pa). The three controller floats after the value differ per object and are written back unchanged. CP and PP answer with the same type and feedback id, so only one of them is requested per cycle.
+- **Status** objects `[source][operation mode][control mode][set point]`: `86/10` local control mode, `86/6` local request, `86/8` realized request (what the pump runs). The panel settings are `86/351`–`359` (`[control mode][set point]`); choosing one in the app writes the control mode (`86/10`) and then the set point.
 - **Alarms and warnings:** `58000b` (active warnings) and `580000` (active alarms) answer `[count u16][code u16]…` with the same response type, so only one is requested per poll cycle. The event log is `5827`: index `d7` is the header (newest sequence number, 20 entries) and `d8`–`eb` is a 20-slot ring buffer with `[00][seq][00][code][0000][type 03/04][operating seconds u32 BE][0000]`. Slot = `(seq − 1) mod 20`.
 
 Register numbers for the other entities are documented next to their constants in [`alpha2.h`](components/alpha2/alpha2.h).
@@ -153,5 +172,5 @@ Register numbers for the other entities are documented next to their constants i
 ## Credits and license
 
 - Based on [parameter-pollution/esphome-grundfos-alpha2-go](https://github.com/parameter-pollution/esphome-grundfos-alpha2-go), which adapted ESPHome's [`alpha3`](https://github.com/esphome/esphome/tree/dev/esphome/components/alpha3) component to the ALPHA2 GO's measurement registers.
-- See also [Birkemosen/esphome-alpha2go](https://github.com/Birkemosen/esphome-alpha2go), an independent implementation with its own BLE traffic documentation.
+- The constant-pressure set point, panel settings, status objects, min/max curve commands and the extra measurement offsets follow [Birkemosen/esphome-alpha2go](https://github.com/Birkemosen/esphome-alpha2go)'s BLE traffic documentation (GPL-3.0), checked against this project's own captures and tested on an XX-60. It is an independent implementation worth a look too.
 - Licensed under the [GNU GPL v3](LICENSE).

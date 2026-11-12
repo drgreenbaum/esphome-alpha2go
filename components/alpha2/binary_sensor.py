@@ -9,6 +9,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.GenerateID(CONF_ALPHA2_ID): cv.use_id(Alpha2),
         # Manual venting in progress, register 560008.
         cv.Optional("venting_active"): binary_sensor.binary_sensor_schema(),
+        # AutoAdapt is the active control mode (realized request 86/8).
+        cv.Optional("autoadapt"): binary_sensor.binary_sensor_schema(icon="mdi:auto-mode"),
     }
 )
 
@@ -19,3 +21,7 @@ async def to_code(config):
     if venting_active_config := config.get("venting_active"):
         sens = await binary_sensor.new_binary_sensor(venting_active_config)
         cg.add(hub.set_venting_active_sensor(sens))
+
+    if autoadapt_config := config.get("autoadapt"):
+        sens = await binary_sensor.new_binary_sensor(autoadapt_config)
+        cg.add(hub.set_autoadapt_sensor(sens))

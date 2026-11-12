@@ -6,12 +6,17 @@ from esphome.const import CONF_TYPE, UNIT_CUBIC_METER_PER_HOUR, UNIT_METER
 from . import Alpha2, CONF_ALPHA2_ID, alpha2_ns
 
 Alpha2PressureSetpointNumber = alpha2_ns.class_("Alpha2PressureSetpointNumber", number.Number, cg.Component)
+Alpha2ConstPressureSetpointNumber = alpha2_ns.class_(
+    "Alpha2ConstPressureSetpointNumber", number.Number, cg.Component
+)
 Alpha2FlowSetpointNumber = alpha2_ns.class_("Alpha2FlowSetpointNumber", number.Number, cg.Component)
 Alpha2SpeedSetpointNumber = alpha2_ns.class_("Alpha2SpeedSetpointNumber", number.Number, cg.Component)
 Alpha2MinFlowLimitNumber = alpha2_ns.class_("Alpha2MinFlowLimitNumber", number.Number, cg.Component)
 Alpha2MaxFlowLimitNumber = alpha2_ns.class_("Alpha2MaxFlowLimitNumber", number.Number, cg.Component)
 
-TYPE_PRESSURE = "pressure_setpoint"
+TYPE_PRESSURE = "pressure_setpoint"  # deprecated alias of proportional_pressure_setpoint
+TYPE_PROP_PRESSURE = "proportional_pressure_setpoint"
+TYPE_CONST_PRESSURE = "constant_pressure_setpoint"
 TYPE_FLOW = "flow_setpoint"
 TYPE_SPEED = "speed_setpoint"
 TYPE_MIN_FLOW_LIMIT = "min_flow_limit"
@@ -19,8 +24,20 @@ TYPE_MAX_FLOW_LIMIT = "max_flow_limit"
 
 CONFIG_SCHEMA = cv.typed_schema(
     {
+        # Proportional pressure Hset (86/18).
+        TYPE_PROP_PRESSURE: number.number_schema(
+            Alpha2PressureSetpointNumber,
+            unit_of_measurement=UNIT_METER,
+            icon="mdi:gauge",
+        ).extend({cv.GenerateID(CONF_ALPHA2_ID): cv.use_id(Alpha2)}),
         TYPE_PRESSURE: number.number_schema(
             Alpha2PressureSetpointNumber,
+            unit_of_measurement=UNIT_METER,
+            icon="mdi:gauge",
+        ).extend({cv.GenerateID(CONF_ALPHA2_ID): cv.use_id(Alpha2)}),
+        # Constant pressure set point (86/16).
+        TYPE_CONST_PRESSURE: number.number_schema(
+            Alpha2ConstPressureSetpointNumber,
             unit_of_measurement=UNIT_METER,
             icon="mdi:gauge",
         ).extend({cv.GenerateID(CONF_ALPHA2_ID): cv.use_id(Alpha2)}),
@@ -53,7 +70,7 @@ CONFIG_SCHEMA = cv.typed_schema(
 
 async def to_code(config):
     type_ = config[CONF_TYPE]
-    if type_ == TYPE_PRESSURE:
+    if type_ in (TYPE_PRESSURE, TYPE_PROP_PRESSURE, TYPE_CONST_PRESSURE):
         # Range offered by Grundfos GO: 1.0-4.5 m.
         var = await number.new_number(config, min_value=1.0, max_value=4.5, step=0.1)
     elif type_ == TYPE_FLOW:
@@ -71,8 +88,10 @@ async def to_code(config):
     cg.add(var.set_parent(hub))
     # Also register the entity back on the hub so handle_geni_response_()
     # can push live GET-response readback into it.
-    if type_ == TYPE_PRESSURE:
+    if type_ in (TYPE_PRESSURE, TYPE_PROP_PRESSURE):
         cg.add(hub.set_pressure_setpoint_number(var))
+    elif type_ == TYPE_CONST_PRESSURE:
+        cg.add(hub.set_const_pressure_setpoint_number(var))
     elif type_ == TYPE_FLOW:
         cg.add(hub.set_flow_setpoint_number(var))
     elif type_ == TYPE_SPEED:
