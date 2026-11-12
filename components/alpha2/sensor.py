@@ -87,6 +87,53 @@ CONFIG_SCHEMA = (
                 state_class="total_increasing",
                 accuracy_decimals=0,
             ),
+            # Extra process values / motor state. Temperatures are NaN on
+            # some variants (e.g. XX-60) and then stay unknown.
+            cv.Optional("flow_coefficient_kv"): sensor.sensor_schema(
+                accuracy_decimals=2,
+                state_class="measurement",
+            ),
+            cv.Optional("differential_temperature"): sensor.sensor_schema(
+                unit_of_measurement="K",
+                accuracy_decimals=1,
+                state_class="measurement",
+            ),
+            cv.Optional("dc_link_voltage"): sensor.sensor_schema(
+                unit_of_measurement=UNIT_VOLT,
+                device_class="voltage",
+                accuracy_decimals=0,
+                state_class="measurement",
+            ),
+            cv.Optional("converter_temperature"): sensor.sensor_schema(
+                unit_of_measurement=UNIT_CELSIUS,
+                device_class="temperature",
+                accuracy_decimals=1,
+                state_class="measurement",
+            ),
+            cv.Optional("inverter_temperature"): sensor.sensor_schema(
+                unit_of_measurement=UNIT_CELSIUS,
+                device_class="temperature",
+                accuracy_decimals=1,
+                state_class="measurement",
+            ),
+            # Set point the pump is running right now (realized request,
+            # 86/8); only the one matching the active control mode has a
+            # value.
+            cv.Optional("setpoint_head"): sensor.sensor_schema(
+                unit_of_measurement=UNIT_METER,
+                accuracy_decimals=1,
+                icon="mdi:target",
+            ),
+            cv.Optional("setpoint_speed"): sensor.sensor_schema(
+                unit_of_measurement=UNIT_REVOLUTIONS_PER_MINUTE,
+                accuracy_decimals=0,
+                icon="mdi:target",
+            ),
+            cv.Optional("setpoint_flow"): sensor.sensor_schema(
+                unit_of_measurement=UNIT_CUBIC_METER_PER_HOUR,
+                accuracy_decimals=2,
+                icon="mdi:target",
+            ),
             # Active warning / alarm code, 0 = none. Registers 58000b /
             # 580000 (see README for the code list).
             cv.Optional("warning_code"): sensor.sensor_schema(
@@ -168,3 +215,17 @@ async def to_code(config):
     if alarm_code_config := config.get("alarm_code"):
         sens = await sensor.new_sensor(alarm_code_config)
         cg.add(var.set_alarm_code_sensor(sens))
+
+    for key, setter in (
+        ("flow_coefficient_kv", var.set_flow_coefficient_kv_sensor),
+        ("differential_temperature", var.set_differential_temperature_sensor),
+        ("dc_link_voltage", var.set_dc_link_voltage_sensor),
+        ("converter_temperature", var.set_converter_temperature_sensor),
+        ("inverter_temperature", var.set_inverter_temperature_sensor),
+        ("setpoint_head", var.set_setpoint_head_sensor),
+        ("setpoint_speed", var.set_setpoint_speed_sensor),
+        ("setpoint_flow", var.set_setpoint_flow_sensor),
+    ):
+        if key_config := config.get(key):
+            sens = await sensor.new_sensor(key_config)
+            cg.add(setter(sens))

@@ -44,6 +44,7 @@ class Alpha2PreventDisplaySleepSwitch;
 #endif
 #if defined(USE_NUMBER) && defined(USE_SWITCH)
 class Alpha2PressureSetpointNumber;
+class Alpha2ConstPressureSetpointNumber;
 class Alpha2FlowSetpointNumber;
 class Alpha2SpeedSetpointNumber;
 class Alpha2MinFlowLimitNumber;
@@ -62,7 +63,7 @@ static const size_t GENI_RESPONSE_TYPE_LENGTH = 8;
 
 static const uint8_t GENI_RESPONSE_TYPE_FLOW_HEAD[GENI_RESPONSE_TYPE_LENGTH]   = {43, 0, 2, 53, 2, 0, 0, 36};
 static const int16_t GENI_RESPONSE_FLOW_OFFSET = 0;
-static const int16_t GENI_RESPONSE_HEAD_OFFSET = 4;
+static const int16_t GENI_RESPONSE_HEAD_OFFSET = 28;  // head in m (offset 4 = differential pressure in Pa)
 
 static const uint8_t GENI_RESPONSE_TYPE_POWER[GENI_RESPONSE_TYPE_LENGTH] = {48, 0, 1, 0, 3, 0, 0, 41};
 static const int16_t GENI_RESPONSE_VOLTAGE_AC_OFFSET = 0;
@@ -309,6 +310,20 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   void set_start_count_sensor(sensor::Sensor *sensor) { this->start_count_sensor_ = sensor; }
   // Alarm/warning codes (2026-11-12): active lists 58000b / 580000.
   void set_warning_code_sensor(sensor::Sensor *sensor) { this->warning_code_sensor_ = sensor; }
+  // Extra process values (93/290) and motor state (87/69); temperatures are
+  // NaN on some variants (e.g. XX-60) and then stay unknown.
+  void set_flow_coefficient_kv_sensor(sensor::Sensor *s) { this->flow_coefficient_kv_sensor_ = s; }
+  void set_differential_temperature_sensor(sensor::Sensor *s) { this->differential_temperature_sensor_ = s; }
+  void set_dc_link_voltage_sensor(sensor::Sensor *s) { this->dc_link_voltage_sensor_ = s; }
+  void set_converter_temperature_sensor(sensor::Sensor *s) { this->converter_temperature_sensor_ = s; }
+  void set_inverter_temperature_sensor(sensor::Sensor *s) { this->inverter_temperature_sensor_ = s; }
+  // Realized request (86/8): what the pump is actually running right now.
+  void set_setpoint_head_sensor(sensor::Sensor *s) { this->setpoint_head_sensor_ = s; }
+  void set_setpoint_speed_sensor(sensor::Sensor *s) { this->setpoint_speed_sensor_ = s; }
+  void set_setpoint_flow_sensor(sensor::Sensor *s) { this->setpoint_flow_sensor_ = s; }
+#ifdef USE_BINARY_SENSOR
+  void set_autoadapt_sensor(binary_sensor::BinarySensor *s) { this->autoadapt_sensor_ = s; }
+#endif
   void set_alarm_code_sensor(sensor::Sensor *sensor) { this->alarm_code_sensor_ = sensor; }
 #ifdef USE_TEXT_SENSOR
   // Device info (ASCII) text sensors, found 2026-09-04 - see the Class 7
@@ -326,9 +341,17 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   void set_active_warning_text_sensor(text_sensor::TextSensor *s) { this->active_warning_text_sensor_ = s; }
   void set_active_alarm_text_sensor(text_sensor::TextSensor *s) { this->active_alarm_text_sensor_ = s; }
   void set_last_event_text_sensor(text_sensor::TextSensor *s) { this->last_event_text_sensor_ = s; }
+  void set_control_source_text_sensor(text_sensor::TextSensor *s) { this->control_source_text_sensor_ = s; }
+  void set_operation_mode_text_sensor(text_sensor::TextSensor *s) { this->operation_mode_text_sensor_ = s; }
+  void set_control_mode_text_sensor(text_sensor::TextSensor *s) { this->control_mode_text_sensor_ = s; }
 #endif
 #if defined(USE_SELECT) && defined(USE_SWITCH)
   void set_operating_mode_select(select::Select *sel) { this->operating_mode_select_ = sel; }
+  void set_panel_setting_select(select::Select *sel) { this->panel_setting_select_ = sel; }
+  void set_curve_select(select::Select *sel) { this->curve_select_ = sel; }
+  // Panel setting (I/II/III, AutoAdapt) and min/max curve writes.
+  void write_panel_setting(const std::string &label);
+  void write_curve(const std::string &label);
 #endif
 
 #ifdef USE_SWITCH
@@ -349,6 +372,9 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   }
 #if defined(USE_NUMBER)
   void set_pressure_setpoint_number(Alpha2PressureSetpointNumber *n) { this->pressure_setpoint_number_ = n; }
+  void set_const_pressure_setpoint_number(Alpha2ConstPressureSetpointNumber *n) {
+    this->const_pressure_setpoint_number_ = n;
+  }
   void set_flow_setpoint_number(Alpha2FlowSetpointNumber *n) { this->flow_setpoint_number_ = n; }
   void set_speed_setpoint_number(Alpha2SpeedSetpointNumber *n) { this->speed_setpoint_number_ = n; }
   void set_min_flow_limit_number(Alpha2MinFlowLimitNumber *n) { this->min_flow_limit_number_ = n; }
@@ -410,7 +436,10 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   // this builds a fresh frame for an ARBITRARY target instead of replaying
   // a fixed one. Register 9b560012, DataObject 0x56 sub-index 0x12. meters:
   // target head/pressure setpoint in meters (raw = meters / 0.000102).
-  void write_pressure_setpoint(float meters);
+  void write_pressure_setpoint(float meters);  // proportional pressure, register 86/18 (0x12)
+  void write_const_pressure_setpoint(float meters);  // constant pressure, register 86/16 (0x10)
+  // Shared 35-byte Class-10 SET for the 86/x setpoint objects (type 302).
+  void write_setpoint_raw_(uint8_t sub_id, uint8_t feedback_id, float raw, const uint8_t *tail12, const char *what);
 
   // Same technique, register 9b560028 (DataObject 0x56 sub-index 0x28),
   // constant tail (0.6, 1.6, 0.4) instead of pressure's (0.5, 8.0, 0.0).
@@ -457,12 +486,48 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   uint8_t pending_event_list_{0};  // 1 = warnings (58000b), 2 = alarms (580000)
   uint16_t log_newest_seq_{0};      // newest event-log sequence number (5827 header)
   uint16_t log_fetch_seq_{0};       // entry still to fetch, 0 = none
-  bool event_done_{false};
-  uint8_t event_data_[32];
+  // Whole-response accumulation (data part, after the 8-byte type) for
+  // handlers that need the complete payload rather than per-fragment
+  // offsets: events, presets, realized request, setpoint bookkeeping.
+  bool resp_done_{false};
+  uint8_t resp_data_[48];
+  void handle_complete_response_(uint8_t data_len);
+  sensor::Sensor *flow_coefficient_kv_sensor_{nullptr};
+  sensor::Sensor *differential_temperature_sensor_{nullptr};
+  sensor::Sensor *dc_link_voltage_sensor_{nullptr};
+  sensor::Sensor *converter_temperature_sensor_{nullptr};
+  sensor::Sensor *inverter_temperature_sensor_{nullptr};
+  sensor::Sensor *setpoint_head_sensor_{nullptr};
+  sensor::Sensor *setpoint_speed_sensor_{nullptr};
+  sensor::Sensor *setpoint_flow_sensor_{nullptr};
+#ifdef USE_BINARY_SENSOR
+  binary_sensor::BinarySensor *autoadapt_sensor_{nullptr};
+#endif
+  // Setpoint/preset bookkeeping. CP (86/16) and PP (86/18) answer with the
+  // same type AND the same feedback id, and the nine panel presets
+  // (86/351..359) share one type too - so only one of each is requested per
+  // update() and these remember which one is in flight.
+  uint8_t pending_pressure_{0};  // 1 = CP (0x10), 2 = PP (0x12)
+  int8_t pending_preset_{-1};    // 0..8 = 86/351..359
+  float cp_setpoint_raw_{NAN};
+  float pp_setpoint_raw_{NAN};
+  float cc_setpoint_raw_{NAN};
+  uint8_t local_control_mode_{0xff};  // from 86/10 (56000a)
+  uint8_t preset_mode_[9];
+  float preset_raw_[9];
+  uint16_t preset_valid_{0};  // bit i = preset i read
+  void update_panel_setting_state_();
+  const char *last_panel_label_{nullptr};  // points into ALPHA2_PANEL_OPTIONS
+  bool need_pressure_poll_() const;
+  bool need_status_poll_() const;
+  bool panel_select_configured_() const;
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *active_warning_text_sensor_{nullptr};
   text_sensor::TextSensor *active_alarm_text_sensor_{nullptr};
   text_sensor::TextSensor *last_event_text_sensor_{nullptr};
+  text_sensor::TextSensor *control_source_text_sensor_{nullptr};
+  text_sensor::TextSensor *operation_mode_text_sensor_{nullptr};
+  text_sensor::TextSensor *control_mode_text_sensor_{nullptr};
   text_sensor::TextSensor *product_type_text_sensor_{nullptr};
   text_sensor::TextSensor *product_no_text_sensor_{nullptr};
   text_sensor::TextSensor *serial_no_text_sensor_{nullptr};
@@ -496,6 +561,8 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
 #endif
 #if defined(USE_SELECT) && defined(USE_SWITCH)
   select::Select *operating_mode_select_{nullptr};
+  select::Select *panel_setting_select_{nullptr};
+  select::Select *curve_select_{nullptr};
 #endif
 #ifdef USE_SWITCH
   Alpha2Switch *power_switch_{nullptr};
@@ -508,6 +575,7 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   Alpha2PreventDisplaySleepSwitch *prevent_display_sleep_switch_{nullptr};
 #ifdef USE_NUMBER
   Alpha2PressureSetpointNumber *pressure_setpoint_number_{nullptr};
+  Alpha2ConstPressureSetpointNumber *const_pressure_setpoint_number_{nullptr};
   Alpha2FlowSetpointNumber *flow_setpoint_number_{nullptr};
   Alpha2SpeedSetpointNumber *speed_setpoint_number_{nullptr};
   Alpha2MinFlowLimitNumber *min_flow_limit_number_{nullptr};
@@ -714,6 +782,28 @@ class Alpha2OperatingModeSelect : public select::Select, public Component {
   void control(const std::string &value) override;
   Alpha2 *parent_{nullptr};
 };
+
+// Panel setting select: Constant curve / constant pressure / proportional
+// pressure I-III (values read from the pump's own 86/351..359 table) and
+// the two AutoAdapt settings. Shows "Advanced" for anything else.
+class Alpha2PanelSettingSelect : public select::Select, public Component {
+ public:
+  void set_parent(Alpha2 *parent) { parent_ = parent; }
+
+ protected:
+  void control(const std::string &value) override { this->parent_->write_panel_setting(value); }
+  Alpha2 *parent_{nullptr};
+};
+
+// Normal / min curve / max curve (Class 3 commands START / MIN / MAX).
+class Alpha2CurveSelect : public select::Select, public Component {
+ public:
+  void set_parent(Alpha2 *parent) { parent_ = parent; }
+
+ protected:
+  void control(const std::string &value) override { this->parent_->write_curve(value); }
+  Alpha2 *parent_{nullptr};
+};
 #endif
 
 // number entity for the pressure/head setpoint (2026-09-04) - see
@@ -729,6 +819,18 @@ class Alpha2PressureSetpointNumber : public number::Number, public Component {
  protected:
   void control(float value) override {
     this->parent_->write_pressure_setpoint(value);
+    this->publish_state(value);
+  }
+  Alpha2 *parent_{nullptr};
+};
+
+class Alpha2ConstPressureSetpointNumber : public number::Number, public Component {
+ public:
+  void set_parent(Alpha2 *parent) { parent_ = parent; }
+
+ protected:
+  void control(float value) override {
+    this->parent_->write_const_pressure_setpoint(value);
     this->publish_state(value);
   }
   Alpha2 *parent_{nullptr};

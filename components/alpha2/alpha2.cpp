@@ -218,6 +218,242 @@ bool Alpha2::is_current_response_type_(const uint8_t *response_type) {
   return !std::memcmp(this->response_type_, response_type, GENI_RESPONSE_TYPE_LENGTH);
 }
 
+
+// ---------------------------------------------------------------------------
+// Status, presets and extra values (2026-11-12). Object layouts follow
+// Birkemosen/esphome-alpha2go's docs/ble-traffic.md (GPL-3.0) and were
+// checked against this project's own HCI captures.
+// ---------------------------------------------------------------------------
+static float alpha2_be_float_(const uint8_t *p) {
+  uint32_t bits = (uint32_t) p[0] << 24 | (uint32_t) p[1] << 16 | (uint32_t) p[2] << 8 | p[3];
+  float f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+static float alpha2_celsius_(float v) { return v > 200.0F ? v - 273.15F : v; }
+static const float ALPHA2_PA_TO_M = 0.000102F;  // 1 m head = 9804 Pa
+
+#ifdef USE_TEXT_SENSOR
+static const char *alpha2_operation_mode_text_(uint8_t v) {
+  switch (v) {
+    case 0: return "Auto";
+    case 1: return "Stop";
+    case 2: return "Min curve";
+    case 3: return "Max curve";
+    case 4: return "User defined";
+    case 5: return "Forced start";
+    case 6: return "No command";
+    case 7: return "Hand";
+    case 8: return "Standby";
+    case 9: return "Stop without delay";
+    case 10: return "Emergency run";
+    default: return "Unknown";
+  }
+}
+static const char *alpha2_control_mode_text_(uint8_t v) {
+  switch (v) {
+    case 0: return "Constant pressure";
+    case 1: return "Proportional pressure";
+    case 2: return "Constant curve";
+    case 5: return "AutoAdapt";
+    case 8: return "Constant flow";
+    case 13: return "Proportional pressure + AutoAdapt";
+    case 14: return "Constant pressure + AutoAdapt";
+    case 15: return "AutoAdapt radiator and underfloor";
+    case 254: return "None";
+    default: return "Unknown";
+  }
+}
+static const char *alpha2_control_source_text_(uint8_t v) {
+  switch (v) {
+    case 1: return "Local (panel or app)";
+    case 2: return "Bus";
+    case 3: return "Link";
+    case 4: return "External IO";
+    case 5: return "Off button";
+    case 8: return "Event action";
+    case 104: return "AutoNight";
+    case 111: return "Air venting";
+    case 123: return "PWM";
+    case 127: return "Temporary operation control";
+    default: return "Unknown";
+  }
+}
+#endif
+
+static bool alpha2_is_autoadapt_(uint8_t control_mode) {
+  return control_mode == 5 || control_mode == 13 || control_mode == 14 || control_mode == 15;
+}
+
+// Panel setting options; index 0..8 = presets 86/351..359.
+static const char *const ALPHA2_PANEL_OPTIONS[] = {
+    "Constant curve I",        "Constant curve II",        "Constant curve III",
+    "Constant pressure I",     "Constant pressure II",     "Constant pressure III",
+    "Proportional pressure I", "Proportional pressure II", "Proportional pressure III",
+    "Constant pressure + AutoAdapt", "Proportional pressure + AutoAdapt", "Advanced",
+};
+static const uint8_t ALPHA2_PANEL_OPTION_COUNT = 12;
+
+// Controller tails of the 86/x setpoint objects, as the app writes them.
+static const uint8_t ALPHA2_TAIL_CP[12] = {0x3f, 0x19, 0x99, 0x9a, 0x3f, 0x99, 0x99, 0x9a, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t ALPHA2_TAIL_PP[12] = {0x3f, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t ALPHA2_TAIL_CC[12] = {0x3f, 0x80, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00};
+static const uint16_t ALPHA2_PRESET_CRC[9] = {0x3db7, 0xfa0b, 0xea2a, 0xda49, 0xca68,
+                                              0xba8f, 0xaaae, 0x9acd, 0x8aec};
+
+void Alpha2::handle_complete_response_(uint8_t data_len) {
+  const uint8_t *t = this->response_type_;
+  const uint8_t *d = this->resp_data_;
+  if (this->is_current_response_type_(GENI_RESPONSE_TYPE_FLOW_HEAD) && data_len >= 36) {
+    // 93/290: [flow m3/s][diff pressure Pa][?][?][media T][diff T][flow m3/h][head m][Kv]
+    if (this->flow_coefficient_kv_sensor_ != nullptr)
+      this->flow_coefficient_kv_sensor_->publish_state(alpha2_be_float_(d + 32));
+    if (this->differential_temperature_sensor_ != nullptr)
+      this->differential_temperature_sensor_->publish_state(alpha2_be_float_(d + 20));
+  } else if (this->is_current_response_type_(GENI_RESPONSE_TYPE_POWER) && data_len >= 32) {
+    // 87/69: [grid V][DC link V][current][power][?][speed][converter T][inverter T]
+    if (this->dc_link_voltage_sensor_ != nullptr)
+      this->dc_link_voltage_sensor_->publish_state(alpha2_be_float_(d + 4));
+    if (this->converter_temperature_sensor_ != nullptr)
+      this->converter_temperature_sensor_->publish_state(alpha2_celsius_(alpha2_be_float_(d + 24)));
+    if (this->inverter_temperature_sensor_ != nullptr)
+      this->inverter_temperature_sensor_->publish_state(alpha2_celsius_(alpha2_be_float_(d + 28)));
+  } else if (this->is_current_response_type_(GENI_RESPONSE_TYPE_OPERATING_MODE) && data_len >= 7) {
+    // Operation request objects: [source][operation mode][control mode][set point float].
+    uint8_t source = d[0];
+    if (source == 0x00 && d[1] == GENI_DISCRIMINATOR_OPERATING_MODE) {
+      // 86/10 local control mode
+      this->local_control_mode_ = d[2];
+      this->update_panel_setting_state_();
+    } else if (source != 0x00 && source != GENI_DISCRIMINATOR_VENTING_ACTIVE) {
+      // 86/8 realized request - what the pump runs right now
+      uint8_t op_mode = d[1];
+      uint8_t control_mode = d[2];
+      float sp = alpha2_be_float_(d + 3);
+      ESP_LOGD(TAG, "[%s] REALIZED REQUEST source %u op %u control %u sp %.4g", this->parent_->address_str(), source,
+               op_mode, control_mode, sp);
+#ifdef USE_TEXT_SENSOR
+      if (this->control_source_text_sensor_ != nullptr)
+        this->control_source_text_sensor_->publish_state(alpha2_control_source_text_(source));
+      if (this->operation_mode_text_sensor_ != nullptr)
+        this->operation_mode_text_sensor_->publish_state(alpha2_operation_mode_text_(op_mode));
+      if (this->control_mode_text_sensor_ != nullptr)
+        this->control_mode_text_sensor_->publish_state(alpha2_control_mode_text_(control_mode));
+#endif
+#ifdef USE_BINARY_SENSOR
+      if (this->autoadapt_sensor_ != nullptr)
+        this->autoadapt_sensor_->publish_state(alpha2_is_autoadapt_(control_mode));
+#endif
+      bool pressure_mode = control_mode == 0 || control_mode == 1 || alpha2_is_autoadapt_(control_mode);
+      if (this->setpoint_head_sensor_ != nullptr)
+        this->setpoint_head_sensor_->publish_state(pressure_mode ? sp * ALPHA2_PA_TO_M : NAN);
+      if (this->setpoint_speed_sensor_ != nullptr)
+        this->setpoint_speed_sensor_->publish_state(control_mode == 2 ? sp : NAN);
+      if (this->setpoint_flow_sensor_ != nullptr)
+        this->setpoint_flow_sensor_->publish_state(control_mode == 8 ? sp * 3600.0F : NAN);
+#if defined(USE_SELECT) && defined(USE_SWITCH)
+      if (this->curve_select_ != nullptr)
+        this->curve_select_->publish_state(op_mode == 2 ? "Min curve" : (op_mode == 3 ? "Max curve" : "Normal"));
+#endif
+    }
+  } else if (this->is_current_response_type_(GENI_RESPONSE_TYPE_SETPOINT) && data_len >= 6) {
+    float raw = alpha2_be_float_(d + 2);
+    if (d[1] == GENI_SETPOINT_DISCRIMINATOR_PRESSURE) {
+      if (this->pending_pressure_ == 1) {
+        this->cp_setpoint_raw_ = raw;
+#if defined(USE_NUMBER) && defined(USE_SWITCH)
+        if (this->const_pressure_setpoint_number_ != nullptr)
+          this->const_pressure_setpoint_number_->publish_state(roundf(raw * ALPHA2_PA_TO_M * 10.0F) / 10.0F);
+#endif
+      } else if (this->pending_pressure_ == 2) {
+        this->pp_setpoint_raw_ = raw;
+#if defined(USE_NUMBER) && defined(USE_SWITCH)
+        if (this->pressure_setpoint_number_ != nullptr)
+          this->pressure_setpoint_number_->publish_state(roundf(raw * ALPHA2_PA_TO_M * 10.0F) / 10.0F);
+#endif
+      }
+      this->pending_pressure_ = 0;
+      this->update_panel_setting_state_();
+    } else if (d[1] == GENI_SETPOINT_DISCRIMINATOR_SPEED) {
+      this->cc_setpoint_raw_ = raw;
+      this->update_panel_setting_state_();
+    }
+  } else if (t[1] == 0x00 && t[2] == 0x03 && t[3] == 0x65 && t[4] == 0x01 && data_len >= 5) {
+    // 86/351..359 panel presets: [control mode][set point float]
+    if (this->pending_preset_ >= 0 && this->pending_preset_ < 9) {
+      this->preset_mode_[this->pending_preset_] = d[0];
+      this->preset_raw_[this->pending_preset_] = alpha2_be_float_(d + 1);
+      this->preset_valid_ |= 1 << this->pending_preset_;
+      ESP_LOGD(TAG, "[%s] PRESET %d: mode %u value %.1f", this->parent_->address_str(), this->pending_preset_, d[0],
+               this->preset_raw_[this->pending_preset_]);
+      this->update_panel_setting_state_();
+    }
+    this->pending_preset_ = -1;
+  }
+}
+
+void Alpha2::update_panel_setting_state_() {
+#if defined(USE_SELECT) && defined(USE_SWITCH)
+  if (this->panel_setting_select_ == nullptr || this->local_control_mode_ == 0xff)
+    return;
+  const char *label = "Advanced";
+  uint8_t mode = this->local_control_mode_;
+  if (mode == 14) {
+    label = "Constant pressure + AutoAdapt";
+  } else if (mode == 13) {
+    label = "Proportional pressure + AutoAdapt";
+  } else if (mode == 0 || mode == 1 || mode == 2) {
+    float current = mode == 0 ? this->cp_setpoint_raw_ : (mode == 1 ? this->pp_setpoint_raw_ : this->cc_setpoint_raw_);
+    if (std::isnan(current))
+      return;  // wait until the matching setpoint has been read
+    for (uint8_t i = 0; i < 9; i++) {
+      if (!(this->preset_valid_ & (1 << i)) || this->preset_mode_[i] != mode)
+        continue;
+      if (fabsf(current - this->preset_raw_[i]) <= fabsf(this->preset_raw_[i]) * 0.005F) {
+        label = ALPHA2_PANEL_OPTIONS[i];
+        break;
+      }
+    }
+  }
+  if (label != this->last_panel_label_) {
+    this->last_panel_label_ = label;
+    this->panel_setting_select_->publish_state(label);
+  }
+#endif
+}
+
+bool Alpha2::need_pressure_poll_() const {
+#if defined(USE_NUMBER) && defined(USE_SWITCH)
+  if (this->pressure_setpoint_number_ != nullptr || this->const_pressure_setpoint_number_ != nullptr)
+    return true;
+#endif
+  return this->panel_select_configured_();
+}
+
+bool Alpha2::panel_select_configured_() const {
+#if defined(USE_SELECT) && defined(USE_SWITCH)
+  return this->panel_setting_select_ != nullptr;
+#else
+  return false;
+#endif
+}
+
+bool Alpha2::need_status_poll_() const {
+  bool need = this->setpoint_head_sensor_ != nullptr || this->setpoint_speed_sensor_ != nullptr ||
+              this->setpoint_flow_sensor_ != nullptr;
+#ifdef USE_TEXT_SENSOR
+  need = need || this->control_source_text_sensor_ != nullptr || this->operation_mode_text_sensor_ != nullptr ||
+         this->control_mode_text_sensor_ != nullptr;
+#endif
+#ifdef USE_BINARY_SENSOR
+  need = need || this->autoadapt_sensor_ != nullptr;
+#endif
+#if defined(USE_SELECT) && defined(USE_SWITCH)
+  need = need || this->curve_select_ != nullptr;
+#endif
+  return need;
+}
+
 // ---------------------------------------------------------------------------
 // Alarms, warnings and event log (2026-11-12). Decoded from an HCI capture
 // of Grundfos GO's "Events" screen with a live code 25 (wrong PWM config)
@@ -298,16 +534,12 @@ bool Alpha2::handle_event_response_(const uint8_t *response, uint16_t length) {
   } else {
     return false;
   }
-  for (uint16_t i = 0; i < length; i++) {
-    int16_t data_offset = this->response_offset_ + i;
-    if (data_offset >= 0 && data_offset < (int16_t) sizeof(this->event_data_))
-      this->event_data_[data_offset] = response[i];
-  }
-  uint8_t data_len = std::min<uint8_t>(t[7], sizeof(this->event_data_));
-  if (this->event_done_ || this->response_offset_ + (int16_t) length < (int16_t) data_len)
-    return true;  // already handled, or wait for the remaining fragment(s)
-  this->event_done_ = true;
-  const uint8_t *d = this->event_data_;
+  (void) response;
+  uint8_t data_len = std::min<uint8_t>(t[7], sizeof(this->resp_data_));
+  if (this->response_offset_ + (int16_t) length < (int16_t) data_len ||
+      this->response_offset_ >= (int16_t) data_len)
+    return true;  // wait for the remaining fragment(s) / trailing CRC fragment
+  const uint8_t *d = this->resp_data_;
 
   if (kind == 1) {
     if (this->pending_event_list_ != 0)
@@ -369,10 +601,22 @@ void Alpha2::handle_geni_response_(const uint8_t *response, uint16_t length) {
     this->response_length_ = response[1] - GENI_RESPONSE_HEADER_LENGTH + 2;  // maybe 2 byte checksum
     this->response_offset_ = -GENI_RESPONSE_HEADER_LENGTH;
     std::memcpy(this->response_type_, response + 5, GENI_RESPONSE_TYPE_LENGTH);
-    this->event_done_ = false;
+    this->resp_done_ = false;
   }
 
+  for (uint16_t i = 0; i < length; i++) {
+    int16_t data_offset = this->response_offset_ + i;
+    if (data_offset >= 0 && data_offset < (int16_t) sizeof(this->resp_data_))
+      this->resp_data_[data_offset] = response[i];
+  }
+  uint8_t resp_len = std::min<uint8_t>(this->response_type_[7], sizeof(this->resp_data_));
+  bool resp_complete = !this->resp_done_ && this->response_offset_ + (int16_t) length >= (int16_t) resp_len;
+  if (resp_complete)
+    this->resp_done_ = true;
+
   if (this->handle_event_response_(response, length)) {
+    if (resp_complete)
+      this->handle_complete_response_(resp_len);
     this->response_offset_ += length;
     return;
   }
@@ -385,7 +629,7 @@ void Alpha2::handle_geni_response_(const uint8_t *response, uint16_t length) {
   if (this->is_current_response_type_(GENI_RESPONSE_TYPE_FLOW_HEAD)) {
     ESP_LOGD(TAG, "[%s] FLOW HEAD Response", this->parent_->address_str());
     extract_publish_sensor_value(GENI_RESPONSE_FLOW_OFFSET, this->flow_sensor_, 3600.0F);
-    extract_publish_sensor_value(GENI_RESPONSE_HEAD_OFFSET, this->head_sensor_, .0001F);
+    extract_publish_sensor_value(GENI_RESPONSE_HEAD_OFFSET, this->head_sensor_, 1.0F);
   } else if (this->is_current_response_type_(GENI_RESPONSE_TYPE_POWER)) {
     ESP_LOGD(TAG, "[%s] POWER Response", this->parent_->address_str());
     extract_publish_sensor_value(GENI_RESPONSE_POWER_OFFSET, this->power_sensor_, 1.0F);
@@ -533,9 +777,7 @@ void Alpha2::handle_geni_response_(const uint8_t *response, uint16_t length) {
     if (rel_offset >= 0 && rel_offset < length) {
       uint8_t discriminator = response[rel_offset];
       if (discriminator == GENI_SETPOINT_DISCRIMINATOR_PRESSURE) {
-        this->extract_publish_number_value_(response, length, this->response_offset_,
-                                            GENI_RESPONSE_SETPOINT_VALUE_OFFSET, this->pressure_setpoint_number_,
-                                            0.000102F, 1);
+        // CP/PP - handled in handle_complete_response_() (pending_pressure_).
       } else if (discriminator == GENI_SETPOINT_DISCRIMINATOR_FLOW) {
         this->extract_publish_number_value_(response, length, this->response_offset_,
                                             GENI_RESPONSE_SETPOINT_VALUE_OFFSET, this->flow_setpoint_number_,
@@ -574,12 +816,17 @@ void Alpha2::handle_geni_response_(const uint8_t *response, uint16_t length) {
                                           GENI_RESPONSE_FLOW_LIMIT_ENABLE_OFFSET, switch_entity);
     }
 #endif
+  } else if (resp_complete) {
+    // Types only handled on the complete payload (presets etc.) - see
+    // handle_complete_response_().
   } else {
     ESP_LOGW(TAG, "unkown GENI response Type %d %d %d %d %d %d %d %d", this->response_type_[0], this->response_type_[1],
              this->response_type_[2], this->response_type_[3], this->response_type_[4], this->response_type_[5],
              this->response_type_[6], this->response_type_[7]);
   }
 
+  if (resp_complete)
+    this->handle_complete_response_(resp_len);
   this->response_offset_ += length;
 }
 
@@ -831,6 +1078,7 @@ void Alpha2::update() {
   bool poll_venting_status = this->venting_status_sensor_ != nullptr;
 #if defined(USE_SELECT) && defined(USE_SWITCH)
   poll_operating_mode = poll_operating_mode || (this->operating_mode_select_ != nullptr);
+  poll_operating_mode = poll_operating_mode || this->panel_select_configured_();
 #endif
 #ifdef USE_SWITCH
   poll_extern_control = poll_extern_control || (this->extern_control_switch_ != nullptr);
@@ -852,7 +1100,8 @@ void Alpha2::update() {
     delay(25);  // need to wait between requests
   }
 #endif
-  bool poll_venting_countdown = this->venting_countdown_sensor_ != nullptr;
+  // 86/8 doubles as the realized request (status entities, curve select).
+  bool poll_venting_countdown = this->venting_countdown_sensor_ != nullptr || this->need_status_poll_();
 #ifdef USE_BINARY_SENSOR
   poll_venting_countdown = poll_venting_countdown || (this->venting_active_sensor_ != nullptr);
 #endif
@@ -920,9 +1169,21 @@ void Alpha2::update() {
   // Setpoint/flow-limit readback polling (2026-09-04) - verbatim real GET
   // request captures. Only polled if the corresponding number entity is
   // configured, so this costs nothing for a component built without them.
-  if (this->pressure_setpoint_number_ != nullptr) {
-    uint8_t geni_request_pressure_setpoint[] = {39, 7, 231, 248, 10, 3, 86, 0, 18, 151, 239};
-    this->send_request_(geni_request_pressure_setpoint, sizeof(geni_request_pressure_setpoint));
+  // CP (86/16) and PP (86/18) setpoints are requested alternately: both
+  // answer with the same type and feedback id (see pending_pressure_).
+  if (this->need_pressure_poll_()) {
+    bool want_cp = this->const_pressure_setpoint_number_ != nullptr || this->panel_select_configured_();
+    bool want_pp = this->pressure_setpoint_number_ != nullptr || this->panel_select_configured_();
+    bool cp_turn = want_cp && (!want_pp || (this->event_poll_counter_ % 2 == 0));
+    if (cp_turn) {
+      uint8_t geni_request_cp_setpoint[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x56, 0x00, 0x10, 0xb7, 0xad};
+      this->pending_pressure_ = 1;
+      this->send_request_(geni_request_cp_setpoint, sizeof(geni_request_cp_setpoint));
+    } else {
+      uint8_t geni_request_pressure_setpoint[] = {39, 7, 231, 248, 10, 3, 86, 0, 18, 151, 239};
+      this->pending_pressure_ = 2;
+      this->send_request_(geni_request_pressure_setpoint, sizeof(geni_request_pressure_setpoint));
+    }
     delay(25);  // need to wait between requests
   }
   if (this->flow_setpoint_number_ != nullptr) {
@@ -930,7 +1191,7 @@ void Alpha2::update() {
     this->send_request_(geni_request_flow_setpoint, sizeof(geni_request_flow_setpoint));
     delay(25);  // need to wait between requests
   }
-  if (this->speed_setpoint_number_ != nullptr) {
+  if (this->speed_setpoint_number_ != nullptr || this->panel_select_configured_()) {
     uint8_t geni_request_speed_setpoint[] = {39, 7, 231, 248, 10, 3, 86, 0, 14, 68, 82};
     this->send_request_(geni_request_speed_setpoint, sizeof(geni_request_speed_setpoint));
     delay(25);  // need to wait between requests
@@ -969,6 +1230,18 @@ void Alpha2::update() {
     this->send_request_(geni_request_alarms, sizeof(geni_request_alarms));
     delay(25);  // need to wait between requests
   }
+#if defined(USE_SELECT) && defined(USE_SWITCH)
+  if (this->panel_setting_select_ != nullptr) {
+    uint8_t idx = cycle % 9;
+    uint8_t geni_request_preset[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x56, 0x01,
+                                     static_cast<uint8_t>(0x5f + idx),
+                                     static_cast<uint8_t>(ALPHA2_PRESET_CRC[idx] >> 8),
+                                     static_cast<uint8_t>(ALPHA2_PRESET_CRC[idx] & 0xff)};
+    this->pending_preset_ = idx;
+    this->send_request_(geni_request_preset, sizeof(geni_request_preset));
+    delay(25);  // need to wait between requests
+  }
+#endif
   if (poll_event_log && this->log_fetch_seq_ != 0) {
     uint8_t slot = (this->log_fetch_seq_ - 1) % GENI_EVENT_LOG_SIZE;
     uint16_t crc = GENI_EVENT_LOG_ENTRY_CRC[slot];
@@ -1305,30 +1578,33 @@ void Alpha2::write_operating_mode(uint8_t code) {
   this->finalize_and_send_(frame, sizeof(frame), 20);
 }
 
-void Alpha2::write_pressure_setpoint(float meters) {
-  // Frame shape confirmed 2026-09-04.:
-  // Class-10 SET, DataObject 0x56 sub-index 0x12, 27 bytes of data:
-  //   [56 00 12 01 2e 01 00 00 12 00 04][target float32 BE][0.5][8.0][0.0]
-  // then a 2-byte CRC (same CRC-16-CCITT as calculate_crc_, verified to
-  // match 5 real captured frames byte-for-byte).
-  uint8_t frame[35] = {
-      0x27, 0x1f, 0xe7, 0xf8, 0x0a, 0x9b, 0x56, 0x00, 0x12, 0x01, 0x2e, 0x01, 0x00,
-      0x00, 0x12, 0x00, 0x04,
-      // bytes 17-20: target, filled below
-      0x00, 0x00, 0x00, 0x00,
-      // bytes 21-32: constant tail (0.5, 8.0, 0.0)
-      0x3f, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-      // bytes 33-34: CRC, filled below
-      0x00, 0x00,
-  };
-  float raw = meters / 0.000102F;
+void Alpha2::write_setpoint_raw_(uint8_t sub_id, uint8_t feedback_id, float raw, const uint8_t *tail12,
+                                 const char *what) {
+  // Class-10 SET of a type-302 setpoint object (86/sub_id), 27 data bytes:
+  //   [56 00 sub 01 2e 01 00 00 12 00 feedback][set point float32 BE][3 controller floats]
+  // Sent split 20 + 15 like the app does.
+  uint8_t frame[35] = {0x27, 0x1f, 0xe7, 0xf8, 0x0a, 0x9b, 0x56, 0x00, sub_id, 0x01, 0x2e, 0x01, 0x00,
+                       0x00, 0x12, 0x00, feedback_id};
   uint32_t bits;
   std::memcpy(&bits, &raw, sizeof(bits));
   bits = htonl(bits);
   std::memcpy(frame + 17, &bits, sizeof(bits));
-
-  ESP_LOGI(TAG, "[%s] Writing pressure setpoint: %.2f m (raw=%.1f)", this->parent_->address_str(), meters, raw);
+  std::memcpy(frame + 21, tail12, 12);
+  ESP_LOGI(TAG, "[%s] Writing %s (86/%u): raw=%.1f", this->parent_->address_str(), what, sub_id, raw);
   this->finalize_and_send_(frame, sizeof(frame), 20);
+}
+
+void Alpha2::write_pressure_setpoint(float meters) {
+  // Proportional pressure Hset, 86/18. Verified on hardware.
+  this->pp_setpoint_raw_ = meters / ALPHA2_PA_TO_M;
+  this->write_setpoint_raw_(0x12, 0x04, this->pp_setpoint_raw_, ALPHA2_TAIL_PP, "proportional pressure setpoint");
+}
+
+void Alpha2::write_const_pressure_setpoint(float meters) {
+  // Constant pressure set point, 86/16 (frame layout from Grundfos GO
+  // captures, see Birkemosen/esphome-alpha2go docs/ble-traffic.md).
+  this->cp_setpoint_raw_ = meters / ALPHA2_PA_TO_M;
+  this->write_setpoint_raw_(0x10, 0x04, this->cp_setpoint_raw_, ALPHA2_TAIL_CP, "constant pressure setpoint");
 }
 
 void Alpha2::write_flow_setpoint(float cubic_meters_per_hour) {
@@ -1387,6 +1663,59 @@ void Alpha2::write_speed_setpoint(float rpm) {
 }
 
 #endif  // USE_SWITCH
+
+#if defined(USE_SELECT) && defined(USE_SWITCH)
+void Alpha2::write_panel_setting(const std::string &label) {
+  int idx = -1;
+  for (uint8_t i = 0; i < ALPHA2_PANEL_OPTION_COUNT; i++) {
+    if (label == ALPHA2_PANEL_OPTIONS[i]) {
+      idx = i;
+      break;
+    }
+  }
+  if (idx < 0 || idx == 11) {  // unknown / "Advanced": nothing to write
+    this->update_panel_setting_state_();
+    return;
+  }
+  if (idx == 9) {
+    this->write_operating_mode(14);  // constant pressure + AutoAdapt
+  } else if (idx == 10) {
+    this->write_operating_mode(13);  // proportional pressure + AutoAdapt
+  } else {
+    if (!(this->preset_valid_ & (1 << idx))) {
+      ESP_LOGW(TAG, "[%s] Panel setting '%s' not read from the pump yet, try again in a minute",
+               this->parent_->address_str(), label.c_str());
+      this->update_panel_setting_state_();
+      return;
+    }
+    // Same sequence as Grundfos GO: control mode first, then the set point.
+    uint8_t mode = this->preset_mode_[idx];
+    float raw = this->preset_raw_[idx];
+    this->write_operating_mode(mode);
+    delay(60);
+    if (mode == 0) {
+      this->cp_setpoint_raw_ = raw;
+      this->write_setpoint_raw_(0x10, 0x04, raw, ALPHA2_TAIL_CP, label.c_str());
+    } else if (mode == 1) {
+      this->pp_setpoint_raw_ = raw;
+      this->write_setpoint_raw_(0x12, 0x04, raw, ALPHA2_TAIL_PP, label.c_str());
+    } else if (mode == 2) {
+      this->cc_setpoint_raw_ = raw;
+      this->write_setpoint_raw_(0x0e, 0xff, raw, ALPHA2_TAIL_CC, label.c_str());
+    }
+  }
+  this->last_panel_label_ = nullptr;  // re-publish from the next readback
+  this->panel_setting_select_->publish_state(label);
+}
+
+void Alpha2::write_curve(const std::string &label) {
+  // Class 3 commands: START (6) = normal operation, MIN (25), MAX (26).
+  uint8_t cmd = label == "Min curve" ? 25 : (label == "Max curve" ? 26 : 6);
+  ESP_LOGI(TAG, "[%s] Curve: %s (command %u)", this->parent_->address_str(), label.c_str(), cmd);
+  this->send_commands_(&cmd, 1);
+  this->curve_select_->publish_state(label);
+}
+#endif
 
 }  // namespace alpha2
 }  // namespace esphome

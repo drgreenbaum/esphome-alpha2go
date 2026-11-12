@@ -73,6 +73,29 @@ sensor:
     start_count:
       name: "Start count"
       entity_category: diagnostic
+    flow_coefficient_kv:
+      name: "Flow coefficient Kv"
+      entity_category: diagnostic
+    dc_link_voltage:
+      name: "DC link voltage"
+      entity_category: diagnostic
+    # NaN (unknown) on some variants, e.g. XX-60:
+    differential_temperature:
+      name: "Differential temperature"
+      entity_category: diagnostic
+    converter_temperature:
+      name: "Converter temperature"
+      entity_category: diagnostic
+    inverter_temperature:
+      name: "Inverter temperature"
+      entity_category: diagnostic
+    # What the pump runs right now (only the active mode's value is set):
+    setpoint_head:
+      name: "Active setpoint head"
+    setpoint_speed:
+      name: "Active setpoint speed"
+    setpoint_flow:
+      name: "Active setpoint flow"
     warning_code:
       name: "Warning code"
     alarm_code:
@@ -84,6 +107,8 @@ binary_sensor:
     venting_active:
       name: "Venting active"
       entity_category: diagnostic
+    autoadapt:
+      name: "AutoAdapt"
 
 text_sensor:
   - platform: alpha2
@@ -94,6 +119,12 @@ text_sensor:
       name: "Active alarm"
     last_event:
       name: "Last event"
+    control_source:
+      name: "Control source"
+    operation_mode:
+      name: "Operation mode"
+    control_mode:
+      name: "Control mode"
     product_type:
       name: "Product type"
       entity_category: diagnostic
@@ -163,16 +194,29 @@ switch:
 
 select:
   - platform: alpha2
+    type: operating_mode
     alpha2_id: alpha2_pump
     name: "Operating mode"
+  - platform: alpha2
+    type: panel_setting
+    alpha2_id: alpha2_pump
+    name: "Panel setting"
+  - platform: alpha2
+    type: curve
+    alpha2_id: alpha2_pump
+    name: "Curve"
 
 number:
-  # Pressure: constant/proportional pressure (not AutoAdapt). Flow: constant
-  # flow. Speed: constant curve. A setpoint has no effect in other modes.
+  # Each set point belongs to one control mode and only has an effect
+  # while the pump runs in that mode (AutoAdapt sets its own).
   - platform: alpha2
-    type: pressure_setpoint
+    type: constant_pressure_setpoint
     alpha2_id: alpha2_pump
-    name: "Pressure setpoint"
+    name: "Constant pressure setpoint"
+  - platform: alpha2
+    type: proportional_pressure_setpoint
+    alpha2_id: alpha2_pump
+    name: "Proportional pressure setpoint"
   - platform: alpha2
     type: flow_setpoint
     alpha2_id: alpha2_pump
