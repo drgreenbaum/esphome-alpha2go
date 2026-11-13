@@ -4,6 +4,7 @@
 
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
+#include "esphome/core/hal.h"
 #include "esphome/components/ble_client/ble_client.h"
 #include "esphome/components/esp32_ble_tracker/esp32_ble_tracker.h"
 #include "esphome/components/sensor/sensor.h"
@@ -23,6 +24,7 @@
 #include "esphome/components/select/select.h"
 #endif
 
+#include <map>
 #include <string>
 
 #ifdef USE_ESP32
@@ -341,6 +343,8 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   void set_active_warning_text_sensor(text_sensor::TextSensor *s) { this->active_warning_text_sensor_ = s; }
   void set_active_alarm_text_sensor(text_sensor::TextSensor *s) { this->active_alarm_text_sensor_ = s; }
   void set_last_event_text_sensor(text_sensor::TextSensor *s) { this->last_event_text_sensor_ = s; }
+  // text_labels: replaces the built-in English status/event texts.
+  void add_text_label(const std::string &from, const std::string &to) { this->text_labels_[from] = to; }
   void set_control_source_text_sensor(text_sensor::TextSensor *s) { this->control_source_text_sensor_ = s; }
   void set_operation_mode_text_sensor(text_sensor::TextSensor *s) { this->operation_mode_text_sensor_ = s; }
   void set_control_mode_text_sensor(text_sensor::TextSensor *s) { this->control_mode_text_sensor_ = s; }
@@ -350,8 +354,8 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   void set_panel_setting_select(select::Select *sel) { this->panel_setting_select_ = sel; }
   void set_curve_select(select::Select *sel) { this->curve_select_ = sel; }
   // Panel setting (I/II/III, AutoAdapt) and min/max curve writes.
-  void write_panel_setting(const std::string &label);
-  void write_curve(const std::string &label);
+  void write_panel_setting(size_t index);
+  void write_curve(size_t index);
 #endif
 
 #ifdef USE_SWITCH
@@ -508,6 +512,14 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   // (86/351..359) share one type too - so only one of each is requested per
   // update() and these remember which one is in flight.
   uint8_t pending_pressure_{0};  // 1 = CP (0x10), 2 = PP (0x12)
+  // Send time of the in-flight ambiguous requests. update() runs twice in
+  // quick succession right after connecting; without this the second call
+  // would overwrite pending_* before the first reply arrives and the reply
+  // would be filed under the wrong register. Older than 2 s = lost.
+  uint32_t pending_pressure_ms_{0};
+  uint32_t pending_preset_ms_{0};
+  uint32_t pending_event_list_ms_{0};
+  static bool still_pending_(bool pending, uint32_t since) { return pending && millis() - since < 2000; }
   int8_t pending_preset_{-1};    // 0..8 = 86/351..359
   float cp_setpoint_raw_{NAN};
   float pp_setpoint_raw_{NAN};
@@ -515,9 +527,20 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   uint8_t local_control_mode_{0xff};  // from 86/10 (56000a)
   uint8_t preset_mode_[9];
   float preset_raw_[9];
-  uint16_t preset_valid_{0};  // bit i = preset i read
+  uint16_t preset_valid_{0};  // bit i = preset i confirmed
+  // A preset is only accepted after the same value was read twice in a row
+  // for its slot (and the control mode matches the slot), so a late reply
+  // filed under the wrong slot cannot stick.
+  float preset_candidate_[9];
+  uint16_t preset_candidate_valid_{0};
   void update_panel_setting_state_();
-  const char *last_panel_label_{nullptr};  // points into ALPHA2_PANEL_OPTIONS
+  std::map<std::string, std::string> text_labels_;
+  std::string tr_(const char *text) const {
+    auto it = this->text_labels_.find(text);
+    return it == this->text_labels_.end() ? std::string(text) : it->second;
+  }
+  std::string format_event_(uint16_t code) const;
+  int8_t last_panel_index_{-1};
   bool need_pressure_poll_() const;
   bool need_status_poll_() const;
   bool panel_select_configured_() const;
@@ -779,7 +802,12 @@ class Alpha2OperatingModeSelect : public select::Select, public Component {
   void set_parent(Alpha2 *parent) { parent_ = parent; }
 
  protected:
-  void control(const std::string &value) override;
+  void control(size_t index) override;
+  void control(const std::string &value) override {
+    auto index = this->index_of(value);
+    if (index.has_value())
+      this->control(*index);
+  }
   Alpha2 *parent_{nullptr};
 };
 
@@ -791,7 +819,12 @@ class Alpha2PanelSettingSelect : public select::Select, public Component {
   void set_parent(Alpha2 *parent) { parent_ = parent; }
 
  protected:
-  void control(const std::string &value) override { this->parent_->write_panel_setting(value); }
+  void control(size_t index) override { this->parent_->write_panel_setting(index); }
+  void control(const std::string &value) override {
+    auto index = this->index_of(value);
+    if (index.has_value())
+      this->control(*index);
+  }
   Alpha2 *parent_{nullptr};
 };
 
@@ -801,7 +834,12 @@ class Alpha2CurveSelect : public select::Select, public Component {
   void set_parent(Alpha2 *parent) { parent_ = parent; }
 
  protected:
-  void control(const std::string &value) override { this->parent_->write_curve(value); }
+  void control(size_t index) override { this->parent_->write_curve(index); }
+  void control(const std::string &value) override {
+    auto index = this->index_of(value);
+    if (index.has_value())
+      this->control(*index);
+  }
   Alpha2 *parent_{nullptr};
 };
 #endif

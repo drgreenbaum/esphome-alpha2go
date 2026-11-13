@@ -185,32 +185,21 @@ static const OperatingModeOption ALPHA2_OPERATING_MODE_OPTIONS[] = {
     {"Constant pressure + AutoAdapt", 0x0e},
 };
 
-static const char *alpha2_operating_mode_label_for_code_(uint8_t code) {
-  for (const auto &opt : ALPHA2_OPERATING_MODE_OPTIONS) {
-    if (opt.code == code)
-      return opt.label;
+// The selects work on option INDEX (labels can be translated in YAML via
+// option_labels); the index order matches the option lists in select.py.
+static int alpha2_operating_mode_index_for_code_(uint8_t code) {
+  for (size_t i = 0; i < sizeof(ALPHA2_OPERATING_MODE_OPTIONS) / sizeof(ALPHA2_OPERATING_MODE_OPTIONS[0]); i++) {
+    if (ALPHA2_OPERATING_MODE_OPTIONS[i].code == code)
+      return i;
   }
-  return nullptr;
+  return -1;
 }
 
-static bool alpha2_operating_mode_code_for_label_(const std::string &label, uint8_t *code) {
-  for (const auto &opt : ALPHA2_OPERATING_MODE_OPTIONS) {
-    if (label == opt.label) {
-      *code = opt.code;
-      return true;
-    }
-  }
-  return false;
-}
-
-void Alpha2OperatingModeSelect::control(const std::string &value) {
-  uint8_t code;
-  if (!alpha2_operating_mode_code_for_label_(value, &code)) {
-    ESP_LOGW(TAG, "Unknown operating mode option: %s", value.c_str());
+void Alpha2OperatingModeSelect::control(size_t index) {
+  if (index >= sizeof(ALPHA2_OPERATING_MODE_OPTIONS) / sizeof(ALPHA2_OPERATING_MODE_OPTIONS[0]))
     return;
-  }
-  this->parent_->write_operating_mode(code);
-  this->publish_state(value);
+  this->parent_->write_operating_mode(ALPHA2_OPERATING_MODE_OPTIONS[index].code);
+  this->publish_state(index);
 }
 #endif
 
@@ -334,11 +323,11 @@ void Alpha2::handle_complete_response_(uint8_t data_len) {
                op_mode, control_mode, sp);
 #ifdef USE_TEXT_SENSOR
       if (this->control_source_text_sensor_ != nullptr)
-        this->control_source_text_sensor_->publish_state(alpha2_control_source_text_(source));
+        this->control_source_text_sensor_->publish_state(this->tr_(alpha2_control_source_text_(source)));
       if (this->operation_mode_text_sensor_ != nullptr)
-        this->operation_mode_text_sensor_->publish_state(alpha2_operation_mode_text_(op_mode));
+        this->operation_mode_text_sensor_->publish_state(this->tr_(alpha2_operation_mode_text_(op_mode)));
       if (this->control_mode_text_sensor_ != nullptr)
-        this->control_mode_text_sensor_->publish_state(alpha2_control_mode_text_(control_mode));
+        this->control_mode_text_sensor_->publish_state(this->tr_(alpha2_control_mode_text_(control_mode)));
 #endif
 #ifdef USE_BINARY_SENSOR
       if (this->autoadapt_sensor_ != nullptr)
@@ -353,7 +342,7 @@ void Alpha2::handle_complete_response_(uint8_t data_len) {
         this->setpoint_flow_sensor_->publish_state(control_mode == 8 ? sp * 3600.0F : NAN);
 #if defined(USE_SELECT) && defined(USE_SWITCH)
       if (this->curve_select_ != nullptr)
-        this->curve_select_->publish_state(op_mode == 2 ? "Min curve" : (op_mode == 3 ? "Max curve" : "Normal"));
+        this->curve_select_->publish_state((size_t) (op_mode == 2 ? 1 : (op_mode == 3 ? 2 : 0)));
 #endif
     }
   } else if (this->is_current_response_type_(GENI_RESPONSE_TYPE_SETPOINT) && data_len >= 6) {
@@ -380,13 +369,25 @@ void Alpha2::handle_complete_response_(uint8_t data_len) {
     }
   } else if (t[1] == 0x00 && t[2] == 0x03 && t[3] == 0x65 && t[4] == 0x01 && data_len >= 5) {
     // 86/351..359 panel presets: [control mode][set point float]
-    if (this->pending_preset_ >= 0 && this->pending_preset_ < 9) {
-      this->preset_mode_[this->pending_preset_] = d[0];
-      this->preset_raw_[this->pending_preset_] = alpha2_be_float_(d + 1);
-      this->preset_valid_ |= 1 << this->pending_preset_;
-      ESP_LOGD(TAG, "[%s] PRESET %d: mode %u value %.1f", this->parent_->address_str(), this->pending_preset_, d[0],
-               this->preset_raw_[this->pending_preset_]);
-      this->update_panel_setting_state_();
+    int8_t slot = this->pending_preset_;
+    if (slot >= 0 && slot < 9) {
+      // Slots 0-2 constant curve (2), 3-5 constant pressure (0), 6-8 proportional pressure (1).
+      uint8_t expected_mode = slot < 3 ? 2 : (slot < 6 ? 0 : 1);
+      float value = alpha2_be_float_(d + 1);
+      if (d[0] != expected_mode) {
+        ESP_LOGD(TAG, "[%s] PRESET %d: mode %u does not fit the slot, ignored", this->parent_->address_str(), slot,
+                 d[0]);
+      } else if ((this->preset_candidate_valid_ & (1 << slot)) && fabsf(this->preset_candidate_[slot] - value) < 0.5F) {
+        this->preset_mode_[slot] = d[0];
+        this->preset_raw_[slot] = value;
+        this->preset_valid_ |= 1 << slot;
+        ESP_LOGD(TAG, "[%s] PRESET %d: %.1f (confirmed)", this->parent_->address_str(), slot, value);
+        this->update_panel_setting_state_();
+      } else {
+        this->preset_candidate_[slot] = value;
+        this->preset_candidate_valid_ |= 1 << slot;
+        ESP_LOGD(TAG, "[%s] PRESET %d: %.1f (candidate)", this->parent_->address_str(), slot, value);
+      }
     }
     this->pending_preset_ = -1;
   }
@@ -396,12 +397,12 @@ void Alpha2::update_panel_setting_state_() {
 #if defined(USE_SELECT) && defined(USE_SWITCH)
   if (this->panel_setting_select_ == nullptr || this->local_control_mode_ == 0xff)
     return;
-  const char *label = "Advanced";
+  int8_t index = 11;  // Advanced
   uint8_t mode = this->local_control_mode_;
   if (mode == 14) {
-    label = "Constant pressure + AutoAdapt";
+    index = 9;  // Constant pressure + AutoAdapt
   } else if (mode == 13) {
-    label = "Proportional pressure + AutoAdapt";
+    index = 10;  // Proportional pressure + AutoAdapt
   } else if (mode == 0 || mode == 1 || mode == 2) {
     float current = mode == 0 ? this->cp_setpoint_raw_ : (mode == 1 ? this->pp_setpoint_raw_ : this->cc_setpoint_raw_);
     if (std::isnan(current))
@@ -410,14 +411,14 @@ void Alpha2::update_panel_setting_state_() {
       if (!(this->preset_valid_ & (1 << i)) || this->preset_mode_[i] != mode)
         continue;
       if (fabsf(current - this->preset_raw_[i]) <= fabsf(this->preset_raw_[i]) * 0.005F) {
-        label = ALPHA2_PANEL_OPTIONS[i];
+        index = i;
         break;
       }
     }
   }
-  if (label != this->last_panel_label_) {
-    this->last_panel_label_ = label;
-    this->panel_setting_select_->publish_state(label);
+  if (index != this->last_panel_index_) {
+    this->last_panel_index_ = index;
+    this->panel_setting_select_->publish_state((size_t) index);
   }
 #endif
 }
@@ -477,10 +478,8 @@ static const char *alpha2_event_text_(uint16_t code) {
   }
 }
 
-static std::string alpha2_format_event_(uint16_t code) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "%u – %s", code, alpha2_event_text_(code));
-  return std::string(buf);
+std::string Alpha2::format_event_(uint16_t code) const {
+  return std::to_string(code) + " – " + this->tr_(alpha2_event_text_(code));
 }
 
 // Event log request frames: register 5827, index 0xd7 = header,
@@ -508,7 +507,7 @@ void Alpha2::publish_event_list_(uint8_t list, const uint8_t *data, uint8_t data
       first = code;
     if (!text.empty())
       text += ", ";
-    text += alpha2_format_event_(code);
+    text += this->format_event_(code);
     count--;
   }
   ESP_LOGD(TAG, "[%s] %s list: first code %u", this->parent_->address_str(), list == 1 ? "WARNING" : "ALARM", first);
@@ -518,7 +517,7 @@ void Alpha2::publish_event_list_(uint8_t list, const uint8_t *data, uint8_t data
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *text_sensor = list == 1 ? this->active_warning_text_sensor_ : this->active_alarm_text_sensor_;
   if (text_sensor != nullptr)
-    text_sensor->publish_state(text.empty() ? std::string("None") : text);
+    text_sensor->publish_state(text.empty() ? this->tr_("None") : text);
 #endif
 }
 
@@ -567,9 +566,9 @@ bool Alpha2::handle_event_response_(const uint8_t *response, uint16_t length) {
 #ifdef USE_TEXT_SENSOR
       if (this->last_event_text_sensor_ != nullptr) {
         char buf[48];
-        snprintf(buf, sizeof(buf), " (operating time %lu d %lu h %lu min)", (unsigned long) (secs / 86400),
+        snprintf(buf, sizeof(buf), " %lu d %lu h %lu min)", (unsigned long) (secs / 86400),
                  (unsigned long) ((secs % 86400) / 3600), (unsigned long) ((secs % 3600) / 60));
-        this->last_event_text_sensor_->publish_state(alpha2_format_event_(code) + buf);
+        this->last_event_text_sensor_->publish_state(this->format_event_(code) + " (" + this->tr_("operating time") + buf);
       }
 #endif
     }
@@ -668,9 +667,9 @@ void Alpha2::handle_geni_response_(const uint8_t *response, uint16_t length) {
         if (this->operating_mode_select_ != nullptr) {
           auto rel_offset = GENI_RESPONSE_OPERATING_MODE_OFFSET - this->response_offset_;
           if (rel_offset >= 0 && rel_offset < length) {
-            const char *label = alpha2_operating_mode_label_for_code_(response[rel_offset]);
-            if (label != nullptr)
-              this->operating_mode_select_->publish_state(label);
+            int idx = alpha2_operating_mode_index_for_code_(response[rel_offset]);
+            if (idx >= 0)
+              this->operating_mode_select_->publish_state((size_t) idx);
           }
         }
 #endif
@@ -831,6 +830,38 @@ void Alpha2::handle_geni_response_(const uint8_t *response, uint16_t length) {
 }
 
 #ifdef USE_TEXT_SENSOR
+static bool alpha2_all_digits_(const char *s) {
+  if (*s == 0)
+    return false;
+  for (; *s; s++)
+    if (*s < '0' || *s > '9')
+      return false;
+  return true;
+}
+
+// Expected shape of each class-7 field (values seen on an ALPHA2 GO XX-60):
+// 1 "ALPHA2 GO", 8 "93074220", 9 "10005168", 10 "2145",
+// 19 "ALPHA2 GO XX-60", 21 "52_6_GSC_V04_...", 50/58 "9297...V01.05...".
+static bool alpha2_device_info_plausible_(uint8_t field, const char *s) {
+  switch (field) {
+    case GENI_DEVICE_INFO_FIELD_PRODUCT_NO:
+    case GENI_DEVICE_INFO_FIELD_SERIAL_NO:
+    case GENI_DEVICE_INFO_FIELD_PRODUCTION_CODE:
+      return alpha2_all_digits_(s);
+    case GENI_DEVICE_INFO_FIELD_GSC_IDENTIFICATION:
+      return strstr(s, "GSC") != nullptr;
+    case GENI_DEVICE_INFO_FIELD_APP_SOFTWARE:
+    case GENI_DEVICE_INFO_FIELD_BLE_SOFTWARE:
+      return s[0] >= '0' && s[0] <= '9' && strchr(s, 'V') != nullptr && strchr(s, '.') != nullptr;
+    case GENI_DEVICE_INFO_FIELD_PRODUCT_TYPE:
+      return strncmp(s, "ALPHA", 5) == 0 && strchr(s, '-') == nullptr;
+    case GENI_DEVICE_INFO_FIELD_GSC_DESCRIPTION:
+      return strncmp(s, "ALPHA", 5) == 0;
+    default:
+      return *s != 0;
+  }
+}
+
 void Alpha2::handle_device_info_response_(const uint8_t *response, uint16_t length) {
   if (this->device_info_offset_ >= this->device_info_length_) {
     if (length < 6 || response[0] != 36 || response[2] != 248 || response[3] != 231 ||
@@ -893,8 +924,15 @@ void Alpha2::handle_device_info_response_(const uint8_t *response, uint16_t leng
       default:
         break;
     }
-    if (target != nullptr)
-      target->publish_state(std::string(reinterpret_cast<char *>(this->device_info_buffer_)));
+    const char *value = reinterpret_cast<char *>(this->device_info_buffer_);
+    if (target != nullptr && alpha2_device_info_plausible_(this->pending_device_info_field_, value)) {
+      target->publish_state(std::string(value));
+    } else if (target != nullptr) {
+      // A reply for another field landed here (the fields share one reply
+      // format) - drop it, the next fetch round retries.
+      ESP_LOGD(TAG, "[%s] device info field %u: '%s' does not fit, ignored", this->parent_->address_str(),
+               this->pending_device_info_field_, value);
+    }
     this->awaiting_device_info_ = false;
   }
 }
@@ -963,6 +1001,8 @@ void Alpha2::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_t gattc
       if (this->alarm_code_sensor_ != nullptr)
         this->alarm_code_sensor_->publish_state(NAN);
       this->pending_event_list_ = 0;
+      this->pending_pressure_ = 0;
+      this->pending_preset_ = -1;
       // Device info text sensors have no NAN/"unknown" state - left showing
       // their last known value on disconnect, same as switches.
 #ifdef USE_TEXT_SENSOR
@@ -1171,7 +1211,8 @@ void Alpha2::update() {
   // configured, so this costs nothing for a component built without them.
   // CP (86/16) and PP (86/18) setpoints are requested alternately: both
   // answer with the same type and feedback id (see pending_pressure_).
-  if (this->need_pressure_poll_()) {
+  if (this->need_pressure_poll_() && !still_pending_(this->pending_pressure_ != 0, this->pending_pressure_ms_)) {
+    this->pending_pressure_ms_ = millis();
     bool want_cp = this->const_pressure_setpoint_number_ != nullptr || this->panel_select_configured_();
     bool want_pp = this->pressure_setpoint_number_ != nullptr || this->panel_select_configured_();
     bool cp_turn = want_cp && (!want_pp || (this->event_poll_counter_ % 2 == 0));
@@ -1219,19 +1260,25 @@ void Alpha2::update() {
 #endif
   uint32_t cycle = this->event_poll_counter_++;
   bool warnings_turn = poll_warnings && (!poll_alarms || cycle % 2 == 0);
-  if (warnings_turn) {
+  if (still_pending_(this->pending_event_list_ != 0, this->pending_event_list_ms_)) {
+    // previous list reply still in flight - skip this round
+  } else if (warnings_turn) {
+    this->pending_event_list_ms_ = millis();
     uint8_t geni_request_warnings[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x58, 0x00, 0x0b, 0x0f, 0xf6};
     this->pending_event_list_ = 1;
     this->send_request_(geni_request_warnings, sizeof(geni_request_warnings));
     delay(25);  // need to wait between requests
   } else if (poll_alarms) {
+    this->pending_event_list_ms_ = millis();
     uint8_t geni_request_alarms[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x58, 0x00, 0x00, 0xbe, 0x9d};
     this->pending_event_list_ = 2;
     this->send_request_(geni_request_alarms, sizeof(geni_request_alarms));
     delay(25);  // need to wait between requests
   }
 #if defined(USE_SELECT) && defined(USE_SWITCH)
-  if (this->panel_setting_select_ != nullptr) {
+  if (this->panel_setting_select_ != nullptr &&
+      !still_pending_(this->pending_preset_ >= 0, this->pending_preset_ms_)) {
+    this->pending_preset_ms_ = millis();
     uint8_t idx = cycle % 9;
     uint8_t geni_request_preset[] = {0x27, 0x07, 0xe7, 0xf8, 0x0a, 0x03, 0x56, 0x01,
                                      static_cast<uint8_t>(0x5f + idx),
@@ -1665,15 +1712,9 @@ void Alpha2::write_speed_setpoint(float rpm) {
 #endif  // USE_SWITCH
 
 #if defined(USE_SELECT) && defined(USE_SWITCH)
-void Alpha2::write_panel_setting(const std::string &label) {
-  int idx = -1;
-  for (uint8_t i = 0; i < ALPHA2_PANEL_OPTION_COUNT; i++) {
-    if (label == ALPHA2_PANEL_OPTIONS[i]) {
-      idx = i;
-      break;
-    }
-  }
-  if (idx < 0 || idx == 11) {  // unknown / "Advanced": nothing to write
+void Alpha2::write_panel_setting(size_t idx) {
+  const char *name = idx < ALPHA2_PANEL_OPTION_COUNT ? ALPHA2_PANEL_OPTIONS[idx] : "?";
+  if (idx >= ALPHA2_PANEL_OPTION_COUNT || idx == 11) {  // unknown / "Advanced": nothing to write
     this->update_panel_setting_state_();
     return;
   }
@@ -1684,7 +1725,7 @@ void Alpha2::write_panel_setting(const std::string &label) {
   } else {
     if (!(this->preset_valid_ & (1 << idx))) {
       ESP_LOGW(TAG, "[%s] Panel setting '%s' not read from the pump yet, try again in a minute",
-               this->parent_->address_str(), label.c_str());
+               this->parent_->address_str(), name);
       this->update_panel_setting_state_();
       return;
     }
@@ -1695,25 +1736,25 @@ void Alpha2::write_panel_setting(const std::string &label) {
     delay(60);
     if (mode == 0) {
       this->cp_setpoint_raw_ = raw;
-      this->write_setpoint_raw_(0x10, 0x04, raw, ALPHA2_TAIL_CP, label.c_str());
+      this->write_setpoint_raw_(0x10, 0x04, raw, ALPHA2_TAIL_CP, name);
     } else if (mode == 1) {
       this->pp_setpoint_raw_ = raw;
-      this->write_setpoint_raw_(0x12, 0x04, raw, ALPHA2_TAIL_PP, label.c_str());
+      this->write_setpoint_raw_(0x12, 0x04, raw, ALPHA2_TAIL_PP, name);
     } else if (mode == 2) {
       this->cc_setpoint_raw_ = raw;
-      this->write_setpoint_raw_(0x0e, 0xff, raw, ALPHA2_TAIL_CC, label.c_str());
+      this->write_setpoint_raw_(0x0e, 0xff, raw, ALPHA2_TAIL_CC, name);
     }
   }
-  this->last_panel_label_ = nullptr;  // re-publish from the next readback
-  this->panel_setting_select_->publish_state(label);
+  this->last_panel_index_ = -1;  // re-publish from the next readback
+  this->panel_setting_select_->publish_state(idx);
 }
 
-void Alpha2::write_curve(const std::string &label) {
-  // Class 3 commands: START (6) = normal operation, MIN (25), MAX (26).
-  uint8_t cmd = label == "Min curve" ? 25 : (label == "Max curve" ? 26 : 6);
-  ESP_LOGI(TAG, "[%s] Curve: %s (command %u)", this->parent_->address_str(), label.c_str(), cmd);
+void Alpha2::write_curve(size_t idx) {
+  // Index 0/1/2 = normal / min / max: Class 3 START (6), MIN (25), MAX (26).
+  uint8_t cmd = idx == 1 ? 25 : (idx == 2 ? 26 : 6);
+  ESP_LOGI(TAG, "[%s] Curve index %u (command %u)", this->parent_->address_str(), (unsigned) idx, cmd);
   this->send_commands_(&cmd, 1);
-  this->curve_select_->publish_state(label);
+  this->curve_select_->publish_state(idx);
 }
 #endif
 

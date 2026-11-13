@@ -26,12 +26,18 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional("control_source"): text_sensor.text_sensor_schema(icon="mdi:account-cog"),
         cv.Optional("operation_mode"): text_sensor.text_sensor_schema(icon="mdi:state-machine"),
         cv.Optional("control_mode"): text_sensor.text_sensor_schema(icon="mdi:tune"),
+        # Replace built-in English texts (status values, event/alarm texts,
+        # "None", "operating time"), e.g. {"Proportional pressure": "Proportionellt tryck"}.
+        cv.Optional("text_labels", default={}): cv.Schema({cv.string: cv.string}),
     }
 )
 
 
 async def to_code(config):
     hub = await cg.get_variable(config[CONF_ALPHA2_ID])
+
+    for source_text, label in config["text_labels"].items():
+        cg.add(hub.add_text_label(source_text, label))
 
     if product_type_config := config.get("product_type"):
         sens = await text_sensor.new_text_sensor(product_type_config)
