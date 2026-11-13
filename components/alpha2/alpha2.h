@@ -24,6 +24,7 @@
 #include "esphome/components/select/select.h"
 #endif
 
+#include <map>
 #include <string>
 
 #ifdef USE_ESP32
@@ -342,6 +343,8 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   void set_active_warning_text_sensor(text_sensor::TextSensor *s) { this->active_warning_text_sensor_ = s; }
   void set_active_alarm_text_sensor(text_sensor::TextSensor *s) { this->active_alarm_text_sensor_ = s; }
   void set_last_event_text_sensor(text_sensor::TextSensor *s) { this->last_event_text_sensor_ = s; }
+  // text_labels: replaces the built-in English status/event texts.
+  void add_text_label(const std::string &from, const std::string &to) { this->text_labels_[from] = to; }
   void set_control_source_text_sensor(text_sensor::TextSensor *s) { this->control_source_text_sensor_ = s; }
   void set_operation_mode_text_sensor(text_sensor::TextSensor *s) { this->operation_mode_text_sensor_ = s; }
   void set_control_mode_text_sensor(text_sensor::TextSensor *s) { this->control_mode_text_sensor_ = s; }
@@ -531,6 +534,12 @@ class Alpha2 : public esphome::ble_client::BLEClientNode, public PollingComponen
   float preset_candidate_[9];
   uint16_t preset_candidate_valid_{0};
   void update_panel_setting_state_();
+  std::map<std::string, std::string> text_labels_;
+  std::string tr_(const char *text) const {
+    auto it = this->text_labels_.find(text);
+    return it == this->text_labels_.end() ? std::string(text) : it->second;
+  }
+  std::string format_event_(uint16_t code) const;
   int8_t last_panel_index_{-1};
   bool need_pressure_poll_() const;
   bool need_status_poll_() const;

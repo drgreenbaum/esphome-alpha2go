@@ -87,6 +87,34 @@ The `sensor` platform creates the hub (`id`), which the other platforms referenc
 
 `active_warning`, `active_alarm` (e.g. `25 – Incorrect PWM configuration`, `None` when empty), `last_event` (e.g. `35 – Air in pump head (operating time 11 d 4 h 14 min)`), `control_source` (e.g. `Local (panel or app)`, `PWM`, `AutoNight`), `operation_mode` (`Auto`, `Stop`, `Min curve`, `Max curve`, …), `control_mode`, plus product info: `product_type`, `product_no`, `serial_no`, `production_code`, `gsc_description`, `gsc_identification`, `app_software`, `ble_software`.
 
+#### Translating texts
+
+All status and event texts are English by default. `text_labels` (on any `text_sensor: platform: alpha2` block) replaces them, and the selects take `option_labels` the same way:
+
+```yaml
+text_sensor:
+  - platform: alpha2
+    alpha2_id: alpha2_pump
+    text_labels:
+      "Proportional pressure": "Proportionellt tryck"
+      "Incorrect PWM configuration": "Felaktig PWM-konfiguration"
+      "None": "Ingen"
+      "operating time": "drifttid"
+    control_mode:
+      name: "Styrläge"
+
+select:
+  - platform: alpha2
+    type: curve
+    alpha2_id: alpha2_pump
+    name: "Kurva"
+    option_labels:
+      "Min curve": "Minkurva"
+      "Max curve": "Maxkurva"
+```
+
+The keys are the English texts exactly as listed in this README; `option_labels` keys are validated.
+
 ### `binary_sensor`
 
 `venting_active` – a manual venting cycle is running. `autoadapt` – an AutoAdapt control mode is active.

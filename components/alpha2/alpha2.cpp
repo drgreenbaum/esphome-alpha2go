@@ -323,11 +323,11 @@ void Alpha2::handle_complete_response_(uint8_t data_len) {
                op_mode, control_mode, sp);
 #ifdef USE_TEXT_SENSOR
       if (this->control_source_text_sensor_ != nullptr)
-        this->control_source_text_sensor_->publish_state(alpha2_control_source_text_(source));
+        this->control_source_text_sensor_->publish_state(this->tr_(alpha2_control_source_text_(source)));
       if (this->operation_mode_text_sensor_ != nullptr)
-        this->operation_mode_text_sensor_->publish_state(alpha2_operation_mode_text_(op_mode));
+        this->operation_mode_text_sensor_->publish_state(this->tr_(alpha2_operation_mode_text_(op_mode)));
       if (this->control_mode_text_sensor_ != nullptr)
-        this->control_mode_text_sensor_->publish_state(alpha2_control_mode_text_(control_mode));
+        this->control_mode_text_sensor_->publish_state(this->tr_(alpha2_control_mode_text_(control_mode)));
 #endif
 #ifdef USE_BINARY_SENSOR
       if (this->autoadapt_sensor_ != nullptr)
@@ -478,10 +478,8 @@ static const char *alpha2_event_text_(uint16_t code) {
   }
 }
 
-static std::string alpha2_format_event_(uint16_t code) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "%u – %s", code, alpha2_event_text_(code));
-  return std::string(buf);
+std::string Alpha2::format_event_(uint16_t code) const {
+  return std::to_string(code) + " – " + this->tr_(alpha2_event_text_(code));
 }
 
 // Event log request frames: register 5827, index 0xd7 = header,
@@ -509,7 +507,7 @@ void Alpha2::publish_event_list_(uint8_t list, const uint8_t *data, uint8_t data
       first = code;
     if (!text.empty())
       text += ", ";
-    text += alpha2_format_event_(code);
+    text += this->format_event_(code);
     count--;
   }
   ESP_LOGD(TAG, "[%s] %s list: first code %u", this->parent_->address_str(), list == 1 ? "WARNING" : "ALARM", first);
@@ -519,7 +517,7 @@ void Alpha2::publish_event_list_(uint8_t list, const uint8_t *data, uint8_t data
 #ifdef USE_TEXT_SENSOR
   text_sensor::TextSensor *text_sensor = list == 1 ? this->active_warning_text_sensor_ : this->active_alarm_text_sensor_;
   if (text_sensor != nullptr)
-    text_sensor->publish_state(text.empty() ? std::string("None") : text);
+    text_sensor->publish_state(text.empty() ? this->tr_("None") : text);
 #endif
 }
 
@@ -568,9 +566,9 @@ bool Alpha2::handle_event_response_(const uint8_t *response, uint16_t length) {
 #ifdef USE_TEXT_SENSOR
       if (this->last_event_text_sensor_ != nullptr) {
         char buf[48];
-        snprintf(buf, sizeof(buf), " (operating time %lu d %lu h %lu min)", (unsigned long) (secs / 86400),
+        snprintf(buf, sizeof(buf), " %lu d %lu h %lu min)", (unsigned long) (secs / 86400),
                  (unsigned long) ((secs % 86400) / 3600), (unsigned long) ((secs % 3600) / 60));
-        this->last_event_text_sensor_->publish_state(alpha2_format_event_(code) + buf);
+        this->last_event_text_sensor_->publish_state(this->format_event_(code) + " (" + this->tr_("operating time") + buf);
       }
 #endif
     }
@@ -832,6 +830,38 @@ void Alpha2::handle_geni_response_(const uint8_t *response, uint16_t length) {
 }
 
 #ifdef USE_TEXT_SENSOR
+static bool alpha2_all_digits_(const char *s) {
+  if (*s == 0)
+    return false;
+  for (; *s; s++)
+    if (*s < '0' || *s > '9')
+      return false;
+  return true;
+}
+
+// Expected shape of each class-7 field (values seen on an ALPHA2 GO XX-60):
+// 1 "ALPHA2 GO", 8 "93074220", 9 "10005168", 10 "2145",
+// 19 "ALPHA2 GO XX-60", 21 "52_6_GSC_V04_...", 50/58 "9297...V01.05...".
+static bool alpha2_device_info_plausible_(uint8_t field, const char *s) {
+  switch (field) {
+    case GENI_DEVICE_INFO_FIELD_PRODUCT_NO:
+    case GENI_DEVICE_INFO_FIELD_SERIAL_NO:
+    case GENI_DEVICE_INFO_FIELD_PRODUCTION_CODE:
+      return alpha2_all_digits_(s);
+    case GENI_DEVICE_INFO_FIELD_GSC_IDENTIFICATION:
+      return strstr(s, "GSC") != nullptr;
+    case GENI_DEVICE_INFO_FIELD_APP_SOFTWARE:
+    case GENI_DEVICE_INFO_FIELD_BLE_SOFTWARE:
+      return s[0] >= '0' && s[0] <= '9' && strchr(s, 'V') != nullptr && strchr(s, '.') != nullptr;
+    case GENI_DEVICE_INFO_FIELD_PRODUCT_TYPE:
+      return strncmp(s, "ALPHA", 5) == 0 && strchr(s, '-') == nullptr;
+    case GENI_DEVICE_INFO_FIELD_GSC_DESCRIPTION:
+      return strncmp(s, "ALPHA", 5) == 0;
+    default:
+      return *s != 0;
+  }
+}
+
 void Alpha2::handle_device_info_response_(const uint8_t *response, uint16_t length) {
   if (this->device_info_offset_ >= this->device_info_length_) {
     if (length < 6 || response[0] != 36 || response[2] != 248 || response[3] != 231 ||
@@ -894,8 +924,15 @@ void Alpha2::handle_device_info_response_(const uint8_t *response, uint16_t leng
       default:
         break;
     }
-    if (target != nullptr)
-      target->publish_state(std::string(reinterpret_cast<char *>(this->device_info_buffer_)));
+    const char *value = reinterpret_cast<char *>(this->device_info_buffer_);
+    if (target != nullptr && alpha2_device_info_plausible_(this->pending_device_info_field_, value)) {
+      target->publish_state(std::string(value));
+    } else if (target != nullptr) {
+      // A reply for another field landed here (the fields share one reply
+      // format) - drop it, the next fetch round retries.
+      ESP_LOGD(TAG, "[%s] device info field %u: '%s' does not fit, ignored", this->parent_->address_str(),
+               this->pending_device_info_field_, value);
+    }
     this->awaiting_device_info_ = false;
   }
 }
