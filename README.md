@@ -103,7 +103,7 @@ The `sensor` platform creates the hub (`id`), which the other platforms referenc
 | `panel_setting` | `Constant curve I`–`III`, `Constant pressure I`–`III`, `Proportional pressure I`–`III`, the two AutoAdapt settings, and `Advanced` (any other set point) |
 | `curve` | `Normal`, `Min curve`, `Max curve` |
 
-All three follow what the pump reports, so changes made on the panel or in the app show up too. `panel_setting` uses the pump's own I/II/III values (read from the pump, so they match your variant); they are read one per poll cycle, so a selection made within the first ~2.5 minutes after connecting is refused with a log warning. `Normal` sends START, which also starts a stopped pump.
+All three follow what the pump reports, so changes made on the panel or in the app show up too. `panel_setting` uses the pump's own I/II/III values (read from the pump, so they match your variant); they are read one per poll cycle and each value must be read twice before it is used, so a selection made within the first ~4.5 minutes after boot is refused with a log warning. `Normal` sends START, which also starts a stopped pump.
 
 ### `number` (`type:`)
 
